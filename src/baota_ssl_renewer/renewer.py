@@ -13,6 +13,10 @@ RenewProgress = Callable[[str, SiteInfo, RenewResult | None], None]
 ProbeProgress = Callable[[str, SiteInfo, ProbeResult | None], None]
 
 
+class FatalProgramError(RuntimeError):
+    """Raised when the batch should stop because later sites will hit the same API/logic error."""
+
+
 @dataclass
 class ScanResult:
     sites: list[SiteInfo] = field(default_factory=list)
@@ -161,6 +165,24 @@ def _any_valid_domain_unbound(site: SiteInfo, domains: list[str]) -> bool:
     return any(not _domain_bound_by_certificate(domain, cert_domains) for domain in domains)
 
 
+def _is_fatal_program_error(exc: Exception) -> bool:
+    if not isinstance(exc, BaotaApiError):
+        return False
+    message = str(exc).lower()
+    fatal_markers = (
+        "http 404 for /acme",
+        "http 404 for /site",
+        "指定参数无效",
+        "invalid parameter",
+        "invalid param",
+        "接口不存在",
+        "not include certificate",
+        "did not include certificate",
+        "non-json response",
+    )
+    return any(marker in message for marker in fatal_markers)
+
+
 def plan_site(site: SiteInfo, probes: list[ProbeResult]) -> SitePlan:
     allowed, reason = should_attempt_renew(site)
     if not allowed:
@@ -247,7 +269,9 @@ def renew_site(
                 except NoRenewableCertificateError:
                     body = client.issue_free_ssl(site, valid_domains, ca)
                     action = "issue"
-        except BaotaApiError as exc:
+        except Exception as exc:  # noqa: BLE001 - classify batch-fatal API/logic errors separately.
+            if _is_fatal_program_error(exc):
+                raise FatalProgramError(str(exc)) from exc
             return RenewResult(
                 panel=config.name,
                 site=site.name,
@@ -295,6 +319,43 @@ def renew_all(
                 if (probe := probes.get((site.panel, site.name, domain.host.lower()))) is not None
             ]
         result = renew_site(config, site, dry_run=dry_run, probes=site_probes)
+        results.append(result)
+        if progress:
+            progress("site_done", site, result)
+    return results
+
+
+def apply_sites_sequential(
+    configs: list[PanelConfig],
+    sites: list[SiteInfo],
+    dry_run: bool = False,
+    progress: RenewProgress | None = None,
+) -> list[RenewResult]:
+    by_panel = {config.name: config for config in configs}
+    results: list[RenewResult] = []
+    for site in sites:
+        if progress:
+            progress("site_start", site, None)
+        config = by_panel.get(site.panel)
+        if not config:
+            result = RenewResult(panel=site.panel, site=site.name, ok=False, message="panel config missing")
+            results.append(result)
+            if progress:
+                progress("site_done", site, result)
+            continue
+        try:
+            result = renew_site(config, site, dry_run=dry_run)
+        except FatalProgramError as exc:
+            result = RenewResult(
+                panel=config.name,
+                site=site.name,
+                ok=False,
+                message=f"fatal program/API error: {exc}",
+            )
+            results.append(result)
+            if progress:
+                progress("site_done", site, result)
+            break
         results.append(result)
         if progress:
             progress("site_done", site, result)

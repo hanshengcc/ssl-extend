@@ -1,8 +1,8 @@
 from baota_ssl_renewer.models import DomainInfo, ProbeResult, SiteInfo, SslInfo
 from baota_ssl_renewer.renewer import build_domain_statuses, summarize_statuses
-from baota_ssl_renewer.renewer import _filter_provider_domains, renew_site, should_attempt_renew
+from baota_ssl_renewer.renewer import _filter_provider_domains, apply_sites_sequential, renew_site, should_attempt_renew
 from baota_ssl_renewer.models import PanelConfig
-from baota_ssl_renewer.bt_api import NoRenewableCertificateError
+from baota_ssl_renewer.bt_api import BaotaApiError, NoRenewableCertificateError
 
 
 def test_should_attempt_renew_requires_lets_encrypt() -> None:
@@ -232,3 +232,121 @@ def test_renew_site_issues_new_certificate_when_valid_domain_is_unbound(monkeypa
     assert result.ok is True
     assert result.message == "issued:example.com,www.example.com"
     assert result.included_domains == ["example.com", "www.example.com"]
+
+
+def test_apply_sites_sequential_continues_after_site_failure(monkeypatch) -> None:
+    class FakeProber:
+        def __init__(self, _client):
+            pass
+
+        def probe_site(self, site):
+            return [ProbeResult(domain=domain.host, ok=True, reason="ok") for domain in site.domains]
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def renew_free_ssl(self, site, _domains, _ca):
+            if site.name == "bad.example.com":
+                raise NoRenewableCertificateError("no renewable")
+            return {"status": True, "msg": f"renewed:{site.name}"}
+
+        def issue_free_ssl(self, site, domains, _ca):
+            if site.name == "bad.example.com":
+                raise Exception("boom")
+            return {"status": True, "msg": f"issued:{site.name}:{','.join(domains)}"}
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    monkeypatch.setattr("baota_ssl_renewer.renewer.WebrootProber", FakeProber)
+    sites = [
+        SiteInfo(
+            panel="p",
+            id=1,
+            name="bad.example.com",
+            path="/www/wwwroot/bad.example.com",
+            domains=[DomainInfo("bad.example.com")],
+            ssl=SslInfo(enabled=True, issuer="Let's Encrypt", domains=["bad.example.com"]),
+        ),
+        SiteInfo(
+            panel="p",
+            id=2,
+            name="ok.example.com",
+            path="/www/wwwroot/ok.example.com",
+            domains=[DomainInfo("ok.example.com")],
+            ssl=SslInfo(enabled=True, issuer="Let's Encrypt", domains=["ok.example.com"]),
+        ),
+    ]
+
+    results = apply_sites_sequential(
+        [PanelConfig(name="p", url="https://panel.example.com", api_key="secret")],
+        sites,
+        dry_run=False,
+    )
+
+    assert len(results) == 2
+    assert results[0].ok is False
+    assert results[1].ok is True
+    assert results[1].message == "renewed:ok.example.com"
+
+
+def test_apply_sites_sequential_stops_after_fatal_program_error(monkeypatch) -> None:
+    class FakeProber:
+        def __init__(self, _client):
+            pass
+
+        def probe_site(self, site):
+            return [ProbeResult(domain=domain.host, ok=True, reason="ok") for domain in site.domains]
+
+    class FakeClient:
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def renew_free_ssl(self, _site, _domains, _ca):
+            raise NoRenewableCertificateError("no renewable")
+
+        def issue_free_ssl(self, _site, _domains, _ca):
+            raise BaotaApiError("server1: 指定参数无效")
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    monkeypatch.setattr("baota_ssl_renewer.renewer.WebrootProber", FakeProber)
+    sites = [
+        SiteInfo(
+            panel="p",
+            id=1,
+            name="bad.example.com",
+            path="/www/wwwroot/bad.example.com",
+            domains=[DomainInfo("bad.example.com")],
+            ssl=SslInfo(enabled=True, issuer="Let's Encrypt", domains=["bad.example.com"]),
+        ),
+        SiteInfo(
+            panel="p",
+            id=2,
+            name="never-run.example.com",
+            path="/www/wwwroot/never-run.example.com",
+            domains=[DomainInfo("never-run.example.com")],
+            ssl=SslInfo(enabled=True, issuer="Let's Encrypt", domains=["never-run.example.com"]),
+        ),
+    ]
+
+    results = apply_sites_sequential(
+        [PanelConfig(name="p", url="https://panel.example.com", api_key="secret")],
+        sites,
+        dry_run=False,
+    )
+
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert "fatal program/API error" in results[0].message
+    assert "指定参数无效" in results[0].message

@@ -12,6 +12,7 @@ from rich.table import Table
 from .config import load_config
 from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
 from .renewer import (
+    apply_sites_sequential,
     build_domain_statuses,
     plan_sites,
     probe_sites,
@@ -131,7 +132,7 @@ def render_domain_statuses(statuses: list[DomainBindingStatus], only: str | None
 
 
 def render_renew_results(results) -> None:
-    table = Table(title="续签结果")
+    table = Table(title="Certificate Results")
     table.add_column("Panel")
     table.add_column("Site")
     table.add_column("Status")
@@ -216,6 +217,22 @@ def renew_with_progress(
         return renew_all(configs, targets, dry_run=dry_run, progress=on_renew, probes=probes)
 
 
+def apply_sequential_with_progress(configs: list[PanelConfig], targets: list[SiteInfo], dry_run: bool):
+    action = "Planning" if dry_run else "Applying"
+    with Progress(*progress_columns(), console=console) as progress:
+        task_id = progress.add_task(f"{action} sites", total=len(targets))
+
+        def on_apply(event: str, site: SiteInfo, result: RenewResult | None) -> None:
+            if event == "site_start":
+                progress.update(task_id, description=f"{action} {site.panel}/{site.name}")
+            elif event == "site_done":
+                status = "ok" if result and result.ok else "failed"
+                progress.update(task_id, description=f"{action} {site.panel}/{site.name}: {status}")
+                progress.advance(task_id)
+
+        return apply_sites_sequential(configs, targets, dry_run=dry_run, progress=on_apply)
+
+
 def https_with_progress(configs: list[PanelConfig], sites: list[SiteInfo], enabled: bool, dry_run: bool):
     action = "Enabling HTTPS" if enabled else "Disabling HTTPS"
     with Progress(*progress_columns(), console=console) as progress:
@@ -295,20 +312,11 @@ def command_renew(args: argparse.Namespace) -> int:
     if not targets:
         console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
         return 1
-    console.print("[cyan]Running webroot preflight before certificate apply.[/]")
-    probes = probe_with_progress(configs, targets)
-    statuses = build_domain_statuses(targets, probes)
-    summary = summarize_statuses(targets, statuses)
-    render_summary(summary)
-    if summary.webroot_failed_count:
-        render_domain_statuses(statuses, only="webroot-failed")
-    render_site_plans(plan_sites(targets, probes))
-    if summary.webroot_ok_count == 0:
-        console.print("[red]No domain passed webroot preflight. Renewal skipped.[/]")
-        return 1
     if args.dry_run:
-        console.print("[cyan]Dry-run mode: probing webroot only; renewal requests will not be submitted.[/]")
-    results = renew_with_progress(configs, targets, dry_run=args.dry_run, probes=probes)
+        console.print("[cyan]Dry-run mode: each site will be preflighted and planned without submitting changes.[/]")
+    else:
+        console.print("[cyan]Applying certificate plan one site at a time.[/]")
+    results = apply_sequential_with_progress(configs, targets, dry_run=args.dry_run)
     render_renew_results(results)
     return 0 if all(result.ok for result in results) else 1
 
