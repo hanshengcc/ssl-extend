@@ -32,6 +32,14 @@ def _domains(site: SiteInfo) -> str:
     return "\n".join(hosts[:5]) + ("\n..." if len(hosts) > 5 else "")
 
 
+def _ssl_state(site: SiteInfo) -> str:
+    if site.ssl.is_litessl:
+        return "LiteSSL"
+    if site.ssl.is_lets_encrypt:
+        return "LE"
+    return site.ssl.provider or site.ssl.issuer or "-"
+
+
 def render_sites(sites: list[SiteInfo]) -> None:
     table = Table(title="宝塔站点证书")
     table.add_column("#", justify="right")
@@ -44,13 +52,12 @@ def render_sites(sites: list[SiteInfo]) -> None:
 
     for index, site in enumerate(sites, start=1):
         allowed, reason = should_attempt_renew(site)
-        ssl_state = "LE" if site.ssl.is_lets_encrypt else site.ssl.provider or site.ssl.issuer or "-"
         table.add_row(
             str(index),
             site.panel,
             site.name,
             _domains(site),
-            ssl_state,
+            _ssl_state(site),
             _date(site.ssl.not_after),
             "yes" if allowed else reason,
         )
@@ -138,7 +145,7 @@ def command_renew(args: argparse.Namespace) -> int:
     render_sites(scan.sites)
     targets = [site for site in scan.sites if should_attempt_renew(site)[0]]
     if not targets:
-        console.print("[yellow]No renewable Let's Encrypt sites found.[/]")
+        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
         return 1
     if args.dry_run:
         console.print("[cyan]Dry-run mode: probing webroot only; renewal requests will not be submitted.[/]")
@@ -157,7 +164,7 @@ def command_interactive(args: argparse.Namespace) -> int:
     render_sites(scan.sites)
     targets = [site for site in scan.sites if should_attempt_renew(site)[0]]
     if not targets:
-        console.print("[yellow]No renewable Let's Encrypt sites found.[/]")
+        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
         return 1
     console.print(f"[cyan]Ready to renew {len(targets)} site(s). Webroot probing will run before each renewal.[/]")
     if not Confirm.ask("一键续签全部可续签站点?", default=False):

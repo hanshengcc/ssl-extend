@@ -1,8 +1,11 @@
 import hashlib
 
+import respx
+from httpx import Response
+
 from baota_ssl_renewer.bt_api import baota_token
 from baota_ssl_renewer.bt_api import BaotaClient
-from baota_ssl_renewer.models import PanelConfig
+from baota_ssl_renewer.models import PanelConfig, SiteInfo
 
 
 def test_baota_token() -> None:
@@ -32,3 +35,25 @@ def test_client_url_preserves_panel_path_prefix() -> None:
         )
     finally:
         client.close()
+
+
+@respx.mock
+def test_renew_free_ssl_sends_litessl_ca() -> None:
+    route = respx.post("https://panel.example.com/ssl?action=renew_lets_ssl").mock(
+        return_value=Response(200, json={"status": True, "msg": "ok"})
+    )
+    client = BaotaClient(PanelConfig(name="server1", url="https://panel.example.com", api_key="secret"))
+
+    try:
+        body = client.renew_free_ssl(
+            SiteInfo(panel="server1", id=7, name="example.com", path="/www/wwwroot/example.com"),
+            ["example.com"],
+            "litessl",
+        )
+    finally:
+        client.close()
+
+    assert body["status"] is True
+    request_body = route.calls.last.request.content.decode()
+    assert "ca=litessl" in request_body
+    assert "auth_type=http" in request_body

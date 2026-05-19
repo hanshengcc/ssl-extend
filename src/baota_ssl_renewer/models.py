@@ -35,14 +35,37 @@ class SslInfo:
     not_after: datetime | None = None
     raw: dict = field(default_factory=dict)
 
+    def _provider_text(self) -> str:
+        raw_values = [
+            self.raw.get("issuer"),
+            self.raw.get("brand"),
+            self.raw.get("ca"),
+            self.raw.get("cert_type"),
+            self.raw.get("auth_type"),
+        ]
+        return " ".join(str(v).lower() for v in (self.provider, self.issuer, *raw_values) if v)
+
     @property
     def is_lets_encrypt(self) -> bool:
-        values = " ".join(
-            str(v).lower()
-            for v in (self.provider, self.issuer, self.raw.get("issuer"), self.raw.get("brand"))
-            if v
-        )
+        values = self._provider_text()
         return "let's encrypt" in values or "lets encrypt" in values or "letsencrypt" in values
+
+    @property
+    def is_litessl(self) -> bool:
+        values = self._provider_text()
+        return "litessl" in values or "trustasia" in values or "trust asia" in values
+
+    @property
+    def renewable_ca(self) -> str | None:
+        if self.is_litessl:
+            return "litessl"
+        if self.is_lets_encrypt:
+            return "letsencrypt"
+        return None
+
+    @property
+    def is_supported_free_ca(self) -> bool:
+        return self.renewable_ca is not None
 
 
 @dataclass

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from ipaddress import ip_address
 from typing import Callable
 
 from .bt_api import BaotaApiError, BaotaClient
@@ -42,11 +43,32 @@ def scan_panels(configs: list[PanelConfig], progress: ScanProgress | None = None
 def should_attempt_renew(site: SiteInfo) -> tuple[bool, str]:
     if not site.ssl.enabled:
         return False, "SSL is not enabled or status is unavailable"
-    if not site.ssl.is_lets_encrypt:
-        return False, "not a Let's Encrypt certificate"
+    if not site.ssl.is_supported_free_ca:
+        return False, "not a supported free certificate provider"
     if not site.domains:
         return False, "site has no domains"
     return True, "ok"
+
+
+def _is_ip_host(host: str) -> bool:
+    try:
+        ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _filter_provider_domains(site: SiteInfo, domains: list[str]) -> tuple[list[str], list[ProbeResult]]:
+    if not site.ssl.is_litessl:
+        return domains, []
+    allowed: list[str] = []
+    skipped: list[ProbeResult] = []
+    for domain in domains:
+        if _is_ip_host(domain):
+            skipped.append(ProbeResult(domain=domain, ok=False, reason="LiteSSL does not support IP certificates"))
+        else:
+            allowed.append(domain)
+    return allowed, skipped
 
 
 def renew_site(config: PanelConfig, site: SiteInfo, dry_run: bool = False) -> RenewResult:
@@ -57,8 +79,9 @@ def renew_site(config: PanelConfig, site: SiteInfo, dry_run: bool = False) -> Re
     with BaotaClient(config) as client:
         prober = WebrootProber(client)
         probes = prober.probe_site(site)
-        valid_domains = [probe.domain for probe in probes if probe.ok]
+        valid_domains, provider_skipped = _filter_provider_domains(site, [probe.domain for probe in probes if probe.ok])
         skipped = [probe for probe in probes if not probe.ok]
+        skipped.extend(provider_skipped)
         if not valid_domains:
             return RenewResult(
                 panel=config.name,
@@ -77,7 +100,8 @@ def renew_site(config: PanelConfig, site: SiteInfo, dry_run: bool = False) -> Re
                 skipped_domains=skipped,
             )
         try:
-            body = client.renew_lets_ssl(site, valid_domains)
+            ca = site.ssl.renewable_ca or "letsencrypt"
+            body = client.renew_free_ssl(site, valid_domains, ca)
         except BaotaApiError as exc:
             return RenewResult(
                 panel=config.name,

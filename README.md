@@ -2,6 +2,8 @@
 
 一个终端工具，用一个 `baota.ini` 管理多个宝塔面板，扫描站点证书状态，并在续签前通过公网 HTTP-01 webroot 探测过滤掉无法验证的域名。
 
+支持 Let's Encrypt 和 LiteSSL 免费证书。LiteSSL 需要宝塔面板 11.5.0 或更新版本。
+
 ## 安装
 
 ```powershell
@@ -39,7 +41,8 @@ baota-ssl-renewer renew --config baota.ini
 
 ## 行为说明
 
-- 默认只尝试续签 Let's Encrypt 证书。
+- 默认只尝试续签 Let's Encrypt 和 LiteSSL 免费证书。
+- LiteSSL 不支持 IP 证书，IP 域名会在续签前自动跳过。
 - 通配符域名不能通过 HTTP-01 webroot 验证，会被跳过。
 - 工具会先在站点根目录写入 `.well-known/acme-challenge/<token>` 探测文件，再从公网访问 `http://domain/.well-known/acme-challenge/<token>`。
 - 只有探测成功的域名会参与续签；失败域名会在结果中显示原因。

@@ -189,12 +189,26 @@ class BaotaClient:
     def delete_file(self, path: str) -> None:
         self.post("/files?action=DeleteFile", {"path": path})
 
-    def renew_lets_ssl(self, site: SiteInfo, domains: list[str]) -> dict[str, Any]:
+    def renew_free_ssl(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
         joined_domains = ",".join(domains)
+        ca_payload = {"ca": ca, "auth_type": "http"}
         attempts = [
-            ("/ssl?action=renew_lets_ssl", {"siteName": site.name, "domains": joined_domains, "id": site.id}),
-            ("/ssl?action=renew_lets_ssl", {"siteName": site.name, "domain": joined_domains, "id": site.id}),
-            ("/site?action=CreateLet", {"siteName": site.name, "domains": joined_domains, "id": site.id}),
+            (
+                "/ssl?action=renew_lets_ssl",
+                {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
+            ),
+            (
+                "/ssl?action=renew_lets_ssl",
+                {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
+            ),
+            (
+                "/site?action=CreateLet",
+                {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
+            ),
+            (
+                "/site?action=CreateLet",
+                {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
+            ),
         ]
         errors: list[str] = []
         for path, payload in attempts:
@@ -208,3 +222,6 @@ class BaotaClient:
                 continue
             return body if isinstance(body, dict) else {"response": body}
         raise BaotaApiError("; ".join(errors) or "renew endpoint unavailable")
+
+    def renew_lets_ssl(self, site: SiteInfo, domains: list[str]) -> dict[str, Any]:
+        return self.renew_free_ssl(site, domains, "letsencrypt")
