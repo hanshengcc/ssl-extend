@@ -2,6 +2,7 @@ from baota_ssl_renewer.models import DomainInfo, ProbeResult, SiteInfo, SslInfo
 from baota_ssl_renewer.renewer import build_domain_statuses, summarize_statuses
 from baota_ssl_renewer.renewer import _filter_provider_domains, renew_site, should_attempt_renew
 from baota_ssl_renewer.models import PanelConfig
+from baota_ssl_renewer.bt_api import NoRenewableCertificateError
 
 
 def test_should_attempt_renew_requires_lets_encrypt() -> None:
@@ -128,3 +129,90 @@ def test_renew_site_dry_run_uses_preflight_probe_results() -> None:
     assert result.ok is True
     assert result.included_domains == ["example.com"]
     assert result.message == "dry-run: renewal not submitted"
+
+
+def test_renew_site_issues_new_certificate_when_no_renewable(monkeypatch) -> None:
+    class FakeClient:
+        def __init__(self, _config):
+            self.issued_domains = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def renew_free_ssl(self, _site, _domains, _ca):
+            raise NoRenewableCertificateError("server1: 当前没有可以续订的证书!")
+
+        def issue_free_ssl(self, _site, domains, _ca):
+            self.issued_domains = domains
+            return {"status": True, "msg": "issued"}
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com"), DomainInfo("bad.example.com")],
+        ssl=SslInfo(enabled=True, issuer="Let's Encrypt"),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret"),
+        site,
+        probes=[
+            ProbeResult(domain="example.com", ok=True, reason="ok"),
+            ProbeResult(domain="bad.example.com", ok=False, reason="HTTP 404"),
+        ],
+    )
+
+    assert result.ok is True
+    assert result.message == "issued"
+    assert result.included_domains == ["example.com"]
+    assert result.skipped_domains[0].domain == "bad.example.com"
+
+
+def test_renew_site_issues_new_certificate_when_valid_domain_is_unbound(monkeypatch) -> None:
+    class FakeClient:
+        renewed = False
+
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def renew_free_ssl(self, _site, _domains, _ca):
+            self.renewed = True
+            return {"status": True, "msg": "renewed"}
+
+        def issue_free_ssl(self, _site, domains, _ca):
+            return {"status": True, "msg": f"issued:{','.join(domains)}"}
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com"), DomainInfo("www.example.com")],
+        ssl=SslInfo(enabled=True, issuer="Let's Encrypt", domains=["example.com"]),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret"),
+        site,
+        probes=[
+            ProbeResult(domain="example.com", ok=True, reason="ok"),
+            ProbeResult(domain="www.example.com", ok=True, reason="ok"),
+        ],
+    )
+
+    assert result.ok is True
+    assert result.message == "issued:example.com,www.example.com"
+    assert result.included_domains == ["example.com", "www.example.com"]

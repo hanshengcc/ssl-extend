@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from ipaddress import ip_address
 from typing import Callable
 
-from .bt_api import BaotaApiError, BaotaClient
+from .bt_api import BaotaApiError, BaotaClient, NoRenewableCertificateError
 from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, StatusSummary
 from .webroot import WebrootProber
 
@@ -156,6 +156,11 @@ def _filter_provider_domains(site: SiteInfo, domains: list[str]) -> tuple[list[s
     return allowed, skipped
 
 
+def _any_valid_domain_unbound(site: SiteInfo, domains: list[str]) -> bool:
+    cert_domains = _domain_set(site.ssl.domains)
+    return any(not _domain_bound_by_certificate(domain, cert_domains) for domain in domains)
+
+
 def renew_site(
     config: PanelConfig,
     site: SiteInfo,
@@ -192,7 +197,16 @@ def renew_site(
             )
         try:
             ca = site.ssl.renewable_ca or "letsencrypt"
-            body = client.renew_free_ssl(site, valid_domains, ca)
+            if _any_valid_domain_unbound(site, valid_domains):
+                body = client.issue_free_ssl(site, valid_domains, ca)
+                action = "issue"
+            else:
+                try:
+                    body = client.renew_free_ssl(site, valid_domains, ca)
+                    action = "renew"
+                except NoRenewableCertificateError:
+                    body = client.issue_free_ssl(site, valid_domains, ca)
+                    action = "issue"
         except BaotaApiError as exc:
             return RenewResult(
                 panel=config.name,
@@ -202,7 +216,8 @@ def renew_site(
                 included_domains=valid_domains,
                 skipped_domains=skipped,
             )
-        message = str(body.get("msg") or body.get("message") or "renew request submitted")
+        default_message = "certificate issue request submitted" if action == "issue" else "renew request submitted"
+        message = str(body.get("msg") or body.get("message") or default_message)
         return RenewResult(
             panel=config.name,
             site=site.name,

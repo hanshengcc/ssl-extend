@@ -53,6 +53,8 @@ baota-ssl-renewer renew --config baota.ini
 - 工具会先在站点根目录写入 `.well-known/acme-challenge/<token>` 探测文件，再从公网访问 `http://domain/.well-known/acme-challenge/<token>`。
 - 只有探测成功的域名会参与续签；失败域名会在结果中显示原因。
 - `renew` 会在提交续签前集中执行 webroot 预检，先输出成功/失败汇总；如果没有任何域名通过预检，会直接跳过续签。
+- 如果站点下任一 webroot 预检通过的域名没有被当前证书覆盖，工具会为该站点用全部预检通过域名新申请证书。
+- 如果宝塔返回“当前没有可以续订的证书”，工具会改为使用该站点 webroot 预检通过的域名新申请证书。
 - 宝塔 SSL 续签使用面板内部接口，已集中封装，若面板版本不兼容，需要按抓包结果调整续签端点或参数。
 
 ## 状态查看

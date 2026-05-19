@@ -15,6 +15,10 @@ class BaotaApiError(RuntimeError):
     pass
 
 
+class NoRenewableCertificateError(BaotaApiError):
+    pass
+
+
 def baota_token(api_key: str, request_time: int | None = None) -> tuple[int, str]:
     timestamp = request_time if request_time is not None else int(time.time())
     key_md5 = hashlib.md5(api_key.encode("utf-8")).hexdigest()
@@ -82,6 +86,20 @@ def _extract_ssl_domains(data: dict[str, Any], cert: dict[str, Any]) -> list[str
 def _looks_existing_file_error(message: str) -> bool:
     lower = message.lower()
     return any(marker in lower for marker in ("exist", "already", "已存在", "存在"))
+
+
+def _looks_no_renewable_certificate_error(message: str) -> bool:
+    lower = message.lower()
+    return any(
+        marker in lower
+        for marker in (
+            "没有可以续订",
+            "没有可续订",
+            "no renewable",
+            "nothing to renew",
+            "not renewable",
+        )
+    )
 
 
 class BaotaClient:
@@ -250,6 +268,21 @@ class BaotaClient:
                 "/ssl?action=renew_lets_ssl",
                 {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
             ),
+        ]
+        return self._try_ssl_attempts(attempts, stop_on_no_renewable=True)
+
+    def issue_free_ssl(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
+        joined_domains = ",".join(domains)
+        ca_payload = {"ca": ca, "auth_type": "http", "auth_to": site.id}
+        attempts = [
+            (
+                "/ssl?action=CreateLet",
+                {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
+            ),
+            (
+                "/ssl?action=CreateLet",
+                {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
+            ),
             (
                 "/site?action=CreateLet",
                 {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
@@ -259,15 +292,31 @@ class BaotaClient:
                 {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
             ),
         ]
+        return self._try_ssl_attempts(attempts, stop_on_no_renewable=False)
+
+    def _try_ssl_attempts(
+        self,
+        attempts: list[tuple[str, dict[str, Any]]],
+        *,
+        stop_on_no_renewable: bool,
+    ) -> dict[str, Any]:
         errors: list[str] = []
         for path, payload in attempts:
             try:
                 body = self.post(path, payload)
+            except BaotaApiError as exc:
+                if stop_on_no_renewable and _looks_no_renewable_certificate_error(str(exc)):
+                    raise NoRenewableCertificateError(str(exc)) from exc
+                errors.append(str(exc))
+                continue
             except Exception as exc:  # noqa: BLE001 - try known endpoint variants.
                 errors.append(str(exc))
                 continue
             if isinstance(body, dict) and body.get("status") is False:
-                errors.append(str(body.get("msg") or body))
+                msg = str(body.get("msg") or body)
+                if stop_on_no_renewable and _looks_no_renewable_certificate_error(msg):
+                    raise NoRenewableCertificateError(f"{self.config.name}: {msg}")
+                errors.append(msg)
                 continue
             return body if isinstance(body, dict) else {"response": body}
         raise BaotaApiError("; ".join(errors) or "renew endpoint unavailable")
