@@ -173,7 +173,12 @@ def scan_with_progress(configs: list[PanelConfig]):
         return scan_panels(configs, progress=on_scan)
 
 
-def renew_with_progress(configs: list[PanelConfig], targets: list[SiteInfo], dry_run: bool):
+def renew_with_progress(
+    configs: list[PanelConfig],
+    targets: list[SiteInfo],
+    dry_run: bool,
+    probes: dict[tuple[str, str, str], ProbeResult] | None = None,
+):
     action = "Probing" if dry_run else "Renewing"
     with Progress(*progress_columns(), console=console) as progress:
         task_id = progress.add_task(f"{action} sites", total=len(targets))
@@ -186,7 +191,7 @@ def renew_with_progress(configs: list[PanelConfig], targets: list[SiteInfo], dry
                 progress.update(task_id, description=f"{action} {site.panel}/{site.name}: {status}")
                 progress.advance(task_id)
 
-        return renew_all(configs, targets, dry_run=dry_run, progress=on_renew)
+        return renew_all(configs, targets, dry_run=dry_run, progress=on_renew, probes=probes)
 
 
 def probe_with_progress(configs: list[PanelConfig], sites: list[SiteInfo]):
@@ -233,9 +238,19 @@ def command_renew(args: argparse.Namespace) -> int:
     if not targets:
         console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
         return 1
+    console.print("[cyan]Running webroot preflight before renewal.[/]")
+    probes = probe_with_progress(configs, targets)
+    statuses = build_domain_statuses(targets, probes)
+    summary = summarize_statuses(targets, statuses)
+    render_summary(summary)
+    if summary.webroot_failed_count:
+        render_domain_statuses(statuses, only="webroot-failed")
+    if summary.webroot_ok_count == 0:
+        console.print("[red]No domain passed webroot preflight. Renewal skipped.[/]")
+        return 1
     if args.dry_run:
         console.print("[cyan]Dry-run mode: probing webroot only; renewal requests will not be submitted.[/]")
-    results = renew_with_progress(configs, targets, dry_run=args.dry_run)
+    results = renew_with_progress(configs, targets, dry_run=args.dry_run, probes=probes)
     render_renew_results(results)
     return 0 if all(result.ok for result in results) else 1
 
@@ -256,7 +271,17 @@ def command_interactive(args: argparse.Namespace) -> int:
     if not Confirm.ask("一键续签全部可续签站点?", default=False):
         console.print("Cancelled.")
         return 0
-    results = renew_with_progress(configs, targets, dry_run=False)
+    console.print("[cyan]Running webroot preflight before renewal.[/]")
+    probes = probe_with_progress(configs, targets)
+    statuses = build_domain_statuses(targets, probes)
+    summary = summarize_statuses(targets, statuses)
+    render_summary(summary)
+    if summary.webroot_failed_count:
+        render_domain_statuses(statuses, only="webroot-failed")
+    if summary.webroot_ok_count == 0:
+        console.print("[red]No domain passed webroot preflight. Renewal skipped.[/]")
+        return 1
+    results = renew_with_progress(configs, targets, dry_run=False, probes=probes)
     render_renew_results(results)
     return 0 if all(result.ok for result in results) else 1
 

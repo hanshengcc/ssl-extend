@@ -47,6 +47,7 @@ class WebrootProber:
         try:
             self.client.create_dir(_join_remote(site.path, ".well-known"))
             self.client.create_dir(challenge_dir)
+            self.client.create_file(challenge_path)
             self.client.save_file(challenge_path, expected)
         except Exception as exc:  # noqa: BLE001
             return ProbeResult(domain=host, ok=False, reason=f"cannot write challenge: {exc}", url=url)

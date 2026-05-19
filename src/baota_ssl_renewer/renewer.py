@@ -156,14 +156,20 @@ def _filter_provider_domains(site: SiteInfo, domains: list[str]) -> tuple[list[s
     return allowed, skipped
 
 
-def renew_site(config: PanelConfig, site: SiteInfo, dry_run: bool = False) -> RenewResult:
+def renew_site(
+    config: PanelConfig,
+    site: SiteInfo,
+    dry_run: bool = False,
+    probes: list[ProbeResult] | None = None,
+) -> RenewResult:
     allowed, reason = should_attempt_renew(site)
     if not allowed:
         return RenewResult(panel=config.name, site=site.name, ok=False, message=reason)
 
     with BaotaClient(config) as client:
-        prober = WebrootProber(client)
-        probes = prober.probe_site(site)
+        if probes is None:
+            prober = WebrootProber(client)
+            probes = prober.probe_site(site)
         valid_domains, provider_skipped = _filter_provider_domains(site, [probe.domain for probe in probes if probe.ok])
         skipped = [probe for probe in probes if not probe.ok]
         skipped.extend(provider_skipped)
@@ -212,6 +218,7 @@ def renew_all(
     sites: list[SiteInfo],
     dry_run: bool = False,
     progress: RenewProgress | None = None,
+    probes: dict[tuple[str, str, str], ProbeResult] | None = None,
 ) -> list[RenewResult]:
     by_panel = {config.name: config for config in configs}
     results: list[RenewResult] = []
@@ -225,7 +232,14 @@ def renew_all(
             if progress:
                 progress("site_done", site, result)
             continue
-        result = renew_site(config, site, dry_run=dry_run)
+        site_probes = None
+        if probes is not None:
+            site_probes = [
+                probe
+                for domain in site.domains
+                if (probe := probes.get((site.panel, site.name, domain.host.lower()))) is not None
+            ]
+        result = renew_site(config, site, dry_run=dry_run, probes=site_probes)
         results.append(result)
         if progress:
             progress("site_done", site, result)

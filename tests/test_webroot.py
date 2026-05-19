@@ -12,6 +12,9 @@ class FakeClient:
     def create_dir(self, path: str) -> None:
         pass
 
+    def create_file(self, path: str) -> None:
+        self.saved[path] = ""
+
     def save_file(self, path: str, body: str) -> None:
         self.saved[path] = body
 

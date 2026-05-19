@@ -1,6 +1,7 @@
-from baota_ssl_renewer.models import DomainInfo, SiteInfo, SslInfo
+from baota_ssl_renewer.models import DomainInfo, ProbeResult, SiteInfo, SslInfo
 from baota_ssl_renewer.renewer import build_domain_statuses, summarize_statuses
-from baota_ssl_renewer.renewer import _filter_provider_domains, should_attempt_renew
+from baota_ssl_renewer.renewer import _filter_provider_domains, renew_site, should_attempt_renew
+from baota_ssl_renewer.models import PanelConfig
 
 
 def test_should_attempt_renew_requires_lets_encrypt() -> None:
@@ -105,3 +106,25 @@ def test_status_treats_wildcard_certificate_as_bound() -> None:
 
     assert statuses[0].certificate_bound is True
     assert statuses[1].certificate_bound is False
+
+
+def test_renew_site_dry_run_uses_preflight_probe_results() -> None:
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com")],
+        ssl=SslInfo(enabled=True, issuer="Let's Encrypt"),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret"),
+        site,
+        dry_run=True,
+        probes=[ProbeResult(domain="example.com", ok=True, reason="ok")],
+    )
+
+    assert result.ok is True
+    assert result.included_domains == ["example.com"]
+    assert result.message == "dry-run: renewal not submitted"

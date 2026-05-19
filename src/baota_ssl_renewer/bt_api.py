@@ -79,6 +79,11 @@ def _extract_ssl_domains(data: dict[str, Any], cert: dict[str, Any]) -> list[str
     return sorted(set(domains))
 
 
+def _looks_existing_file_error(message: str) -> bool:
+    lower = message.lower()
+    return any(marker in lower for marker in ("exist", "already", "已存在", "存在"))
+
+
 class BaotaClient:
     def __init__(self, config: PanelConfig):
         self.config = config
@@ -216,11 +221,18 @@ class BaotaClient:
     def save_file(self, path: str, body: str) -> None:
         self.post("/files?action=SaveFileBody", {"path": path, "data": body, "encoding": "utf-8"})
 
+    def create_file(self, path: str) -> None:
+        body = self.post("/files?action=CreateFile", {"path": path}, raise_api_error=False)
+        if isinstance(body, dict) and body.get("status") is False:
+            msg = str(body.get("msg") or body.get("message") or "")
+            if not _looks_existing_file_error(msg):
+                raise BaotaApiError(f"{self.config.name}: {msg or 'create file failed'}")
+
     def create_dir(self, path: str) -> None:
         body = self.post("/files?action=CreateDir", {"path": path}, raise_api_error=False)
         if isinstance(body, dict) and body.get("status") is False:
             msg = str(body.get("msg") or body.get("message") or "")
-            if "存在" not in msg and "exist" not in msg.lower():
+            if not _looks_existing_file_error(msg):
                 raise BaotaApiError(f"{self.config.name}: {msg or 'create directory failed'}")
 
     def delete_file(self, path: str) -> None:
