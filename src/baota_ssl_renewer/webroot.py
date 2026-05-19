@@ -52,7 +52,9 @@ class WebrootProber:
             return ProbeResult(domain=host, ok=False, reason=f"cannot write challenge: {exc}", url=url)
 
         try:
-            with httpx.Client(timeout=self.timeout, follow_redirects=True) as http:
+            # ACME HTTP-01 may follow HTTP -> HTTPS redirects. Existing certificates can be
+            # expired while renewing, so do not fail the probe on HTTPS certificate validity.
+            with httpx.Client(timeout=self.timeout, follow_redirects=True, verify=False) as http:
                 response = http.get(url)
             if response.status_code != 200:
                 return ProbeResult(domain=host, ok=False, reason=f"HTTP {response.status_code}", url=url)
