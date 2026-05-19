@@ -4,6 +4,7 @@ import hashlib
 import time
 from datetime import datetime
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 
@@ -46,7 +47,6 @@ class BaotaClient:
     def __init__(self, config: PanelConfig):
         self.config = config
         self._client = httpx.Client(
-            base_url=config.url,
             verify=config.verify_ssl,
             timeout=config.timeout,
             follow_redirects=True,
@@ -70,7 +70,15 @@ class BaotaClient:
         if data:
             payload.update(data)
 
-        response = self._client.post(path, data=payload)
+        try:
+            response = self._client.post(self._url(path), data=payload)
+        except httpx.RemoteProtocolError as exc:
+            raise BaotaApiError(
+                f"{self.config.name}: illegal request line. Check whether panel url uses the correct "
+                "scheme (http vs https), port, and any required panel entrance path."
+            ) from exc
+        except httpx.RequestError as exc:
+            raise BaotaApiError(f"{self.config.name}: {exc}") from exc
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -85,6 +93,10 @@ class BaotaClient:
             msg = body.get("msg") or body.get("message") or "request failed"
             raise BaotaApiError(f"{self.config.name}: {msg}")
         return body
+
+    def _url(self, path: str) -> str:
+        base = self.config.url.rstrip("/") + "/"
+        return urljoin(base, path.lstrip("/"))
 
     def list_sites(self) -> list[SiteInfo]:
         body = self.post(
