@@ -1,6 +1,6 @@
 # 宝塔证书续签器
 
-一个终端工具，用一个 `baota.ini` 管理多个宝塔面板，扫描站点证书状态，并在续签前通过公网 HTTP-01 webroot 探测过滤掉无法验证的域名。
+用于批量管理多个宝塔面板站点证书的终端工具。工具会先对站点域名执行 HTTP-01 webroot 预检，只对公网可验证的域名执行续订或新申请，避免单个不可验证域名拖垮整站证书操作。
 
 支持 Let's Encrypt 和 LiteSSL 免费证书。LiteSSL 需要宝塔面板 11.5.0 或更新版本。
 
@@ -13,7 +13,13 @@ python -m venv .venv
 
 ## 配置
 
-复制 `baota.example.ini` 为 `baota.ini`，为每个宝塔面板添加一个 `[panel.*]` 配置段：
+复制示例配置：
+
+```powershell
+Copy-Item baota.example.ini baota.ini
+```
+
+编辑 `baota.ini`，每个 `[panel.*]` 表示一个宝塔面板：
 
 ```ini
 [panel.prod-a]
@@ -23,68 +29,112 @@ verify_ssl = false
 timeout = 15
 ```
 
-宝塔面板需要在“面板设置 -> API 接口”中开启 API，并放行运行本工具的 IP。
+要求：
 
-## 使用
+- 宝塔面板已开启 API。
+- 宝塔 API 白名单已放行运行本工具的 IP。
+- `url` 必须和面板实际协议一致，HTTP 面板不要写成 HTTPS。
+
+## 常用命令
+
+默认读取当前目录的 `baota.ini`。需要指定其他配置文件时，加 `--config <path>`。
+
+查看证书、站点域名和证书覆盖状态：
 
 ```powershell
-baota-ssl-renewer --config baota.ini
+btr cert status
 ```
 
-常用命令：
+执行证书申请/续订预检，不提交任何变更：
 
 ```powershell
-baota-ssl-renewer scan --config baota.ini
-baota-ssl-renewer cert status --config baota.ini
-baota-ssl-renewer cert plan --config baota.ini
-baota-ssl-renewer cert apply --config baota.ini --dry-run
-baota-ssl-renewer cert apply --config baota.ini
-baota-ssl-renewer https enable --config baota.ini --dry-run
-baota-ssl-renewer https enable --config baota.ini --yes
-baota-ssl-renewer https disable --config baota.ini --yes
-baota-ssl-renewer tui --config baota.ini
-baota-ssl-renewer tui --config baota.ini --only webroot-failed
-baota-ssl-renewer status --config baota.ini
-baota-ssl-renewer status --config baota.ini --probe-webroot
-baota-ssl-renewer status --config baota.ini --probe-webroot --only webroot-failed
-baota-ssl-renewer status --config baota.ini --only unbound
-baota-ssl-renewer renew --config baota.ini --dry-run
-baota-ssl-renewer renew --config baota.ini
+btr cert plan
 ```
 
-## 行为说明
+演练完整申请/续订流程，不提交到宝塔：
 
-- 默认只尝试续签 Let's Encrypt 和 LiteSSL 免费证书。
-- LiteSSL 不支持 IP 证书，IP 域名会在续签前自动跳过。
-- 通配符域名不能通过 HTTP-01 webroot 验证，会被跳过。
-- 工具会先在站点根目录写入 `.well-known/acme-challenge/<token>` 探测文件，再从公网访问 `http://domain/.well-known/acme-challenge/<token>`。
-- 只有探测成功的域名会参与续签；失败域名会在结果中显示原因。
-- `renew` 会在提交续签前集中执行 webroot 预检，先输出成功/失败汇总；如果没有任何域名通过预检，会直接跳过续签。
-- 如果站点下任一 webroot 预检通过的域名没有被当前证书覆盖，工具会为该站点用全部预检通过域名新申请证书。
-- 如果站点当前没有启用 SSL，但存在 webroot 预检通过的域名，也会为这些域名新申请证书。
-- 如果宝塔返回“当前没有可以续订的证书”，工具会改为使用该站点 webroot 预检通过的域名新申请证书。
-- 新申请证书使用 `/acme?action=apply_cert_api`，参数为 `domains`、`auth_type`、`auto_to`、`auto_wildcard`、`id`、`ca`；申请成功后调用 `/site?action=SetSSL` 保存证书。
-- 宝塔 SSL 续签使用面板内部接口，已集中封装，若面板版本不兼容，需要按抓包结果调整续签端点或参数。
+```powershell
+btr cert apply --dry-run
+```
 
-## 状态查看
+正式执行证书续订或新申请：
 
-`status` 命令会输出汇总和域名明细：
+```powershell
+btr cert apply
+```
 
-- `Sites`：站点数。
-- `Site-bound domains`：宝塔站点绑定的域名数。
-- `Certificate SAN domains`：当前证书里包含的域名数。
-- `Domains bound in certificate`：站点域名中已被当前证书覆盖的数量。
-- `Domains not bound in certificate`：站点域名中未被当前证书覆盖的数量。
-- `--probe-webroot`：同时检测每个域名是否能通过 webroot 验证。
-- `--only bound|unbound|webroot-ok|webroot-failed`：只显示指定类别。
+查看 webroot 验证失败的域名：
 
-## 推荐命令结构
+```powershell
+btr cert status --probe-webroot --only webroot-failed
+```
+
+批量开启或关闭强制 HTTPS：
+
+```powershell
+btr https enable --yes
+btr https disable --yes
+```
+
+## 证书策略
+
+`cert apply` 的执行顺序：
+
+1. 扫描所有面板站点、绑定域名和当前证书。
+2. 对目标站点执行 webroot 预检。
+3. 跳过不可访问域名、通配符域名和 LiteSSL 不支持的 IP 域名。
+4. 如果所有可访问域名都已被当前证书覆盖，则尝试续订。
+5. 如果任一可访问域名未被当前证书覆盖，则用全部可访问域名新申请证书。
+6. 如果宝塔返回“当前没有可以续订的证书”，则改为新申请证书。
+7. 新申请成功后调用 `/site?action=SetSSL` 保存证书到站点。
+
+新申请证书使用宝塔 ACME 接口：
+
+```text
+POST /acme?action=apply_cert_api
+```
+
+核心参数：
+
+```text
+domains, auth_type, auto_to, auto_wildcard, id, ca
+```
+
+## Webroot 预检
+
+工具会在站点根目录创建临时验证文件：
+
+```text
+.well-known/acme-challenge/<token>
+```
+
+然后从公网访问：
+
+```text
+http://domain/.well-known/acme-challenge/<token>
+```
+
+只有返回 `200` 且内容匹配的域名才会参与证书操作。
+
+常见失败原因：
+
+- 域名未解析到当前站点。
+- 站点 80 端口不可访问。
+- CDN、WAF、反向代理或重写规则拦截了 `/.well-known/acme-challenge/`。
+- 站点根目录和实际 Web 服务目录不一致。
+- 通配符域名需要 DNS-01，不能通过 HTTP-01 webroot 验证。
+
+## 命令结构
+
+推荐使用新命令：
 
 - `cert status`：查看证书覆盖和域名状态。
-- `cert plan`：执行 webroot 预检并展示每个站点会续订还是新申请。
-- `cert apply --dry-run`：执行完整预检和计划展示，但不提交续订/申请。
-- `cert apply`：按计划续订或新申请证书。
-- `https enable --yes`：批量开启强制 HTTPS。
-- `https disable --yes`：批量关闭强制 HTTPS。
+- `cert plan`：执行 webroot 预检并展示 `renew` / `issue` / `skip` 计划。
+- `cert apply --dry-run`：完整演练，不提交申请或续订。
+- `cert apply`：按计划执行续订或新申请。
+- `https enable`：批量开启强制 HTTPS。
+- `https disable`：批量关闭强制 HTTPS。
 
-旧命令 `scan`、`status`、`tui`、`renew` 保留兼容。
+旧命令 `scan`、`status`、`tui`、`renew` 保留兼容，但建议使用 `cert` 和 `https` 命令组。
+
+旧入口 `baota-ssl-renewer` 保留兼容，新文档统一使用短命令 `btr`。

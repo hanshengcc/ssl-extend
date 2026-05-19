@@ -20,6 +20,7 @@ dev = [
 ]
 
 [project.scripts]
+btr = "baota_ssl_renewer.cli:main"
 baota-ssl-renewer = "baota_ssl_renewer.cli:main"
 
 [tool.hatch.build.targets.wheel]

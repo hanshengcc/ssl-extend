@@ -362,7 +362,7 @@ def command_interactive(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="baota-ssl-renewer", description="宝塔证书续签器")
+    parser = argparse.ArgumentParser(prog="btr", description="宝塔证书续签器")
     parser.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     subparsers = parser.add_subparsers(dest="command")
 
