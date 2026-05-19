@@ -35,6 +35,12 @@ baota-ssl-renewer --config baota.ini
 
 ```powershell
 baota-ssl-renewer scan --config baota.ini
+baota-ssl-renewer tui --config baota.ini
+baota-ssl-renewer tui --config baota.ini --only webroot-failed
+baota-ssl-renewer status --config baota.ini
+baota-ssl-renewer status --config baota.ini --probe-webroot
+baota-ssl-renewer status --config baota.ini --probe-webroot --only webroot-failed
+baota-ssl-renewer status --config baota.ini --only unbound
 baota-ssl-renewer renew --config baota.ini --dry-run
 baota-ssl-renewer renew --config baota.ini
 ```
@@ -47,3 +53,15 @@ baota-ssl-renewer renew --config baota.ini
 - 工具会先在站点根目录写入 `.well-known/acme-challenge/<token>` 探测文件，再从公网访问 `http://domain/.well-known/acme-challenge/<token>`。
 - 只有探测成功的域名会参与续签；失败域名会在结果中显示原因。
 - 宝塔 SSL 续签使用面板内部接口，已集中封装，若面板版本不兼容，需要按抓包结果调整续签端点或参数。
+
+## 状态查看
+
+`status` 命令会输出汇总和域名明细：
+
+- `Sites`：站点数。
+- `Site-bound domains`：宝塔站点绑定的域名数。
+- `Certificate SAN domains`：当前证书里包含的域名数。
+- `Domains bound in certificate`：站点域名中已被当前证书覆盖的数量。
+- `Domains not bound in certificate`：站点域名中未被当前证书覆盖的数量。
+- `--probe-webroot`：同时检测每个域名是否能通过 webroot 验证。
+- `--only bound|unbound|webroot-ok|webroot-failed`：只显示指定类别。

@@ -33,6 +33,7 @@ class SslInfo:
     provider: str | None = None
     issuer: str | None = None
     not_after: datetime | None = None
+    domains: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
     def _provider_text(self) -> str:
@@ -94,3 +95,24 @@ class RenewResult:
     message: str
     included_domains: list[str] = field(default_factory=list)
     skipped_domains: list[ProbeResult] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DomainBindingStatus:
+    panel: str
+    site: str
+    domain: str
+    certificate_bound: bool
+    webroot_ok: bool | None = None
+    webroot_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class StatusSummary:
+    site_count: int
+    site_domain_count: int
+    certificate_domain_count: int
+    certificate_bound_domain_count: int
+    certificate_unbound_domain_count: int
+    webroot_ok_count: int = 0
+    webroot_failed_count: int = 0

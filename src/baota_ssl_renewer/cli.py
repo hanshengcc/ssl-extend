@@ -10,8 +10,16 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeEl
 from rich.table import Table
 
 from .config import load_config
-from .models import PanelConfig, RenewResult, SiteInfo
-from .renewer import renew_all, scan_panels, should_attempt_renew, summarize_skips
+from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, StatusSummary
+from .renewer import (
+    build_domain_statuses,
+    probe_sites,
+    renew_all,
+    scan_panels,
+    should_attempt_renew,
+    summarize_skips,
+    summarize_statuses,
+)
 
 console = Console()
 
@@ -67,6 +75,57 @@ def render_sites(sites: list[SiteInfo]) -> None:
 def render_errors(errors: list[str]) -> None:
     for error in errors:
         console.print(f"[red]Error:[/] {error}")
+
+
+def render_summary(summary: StatusSummary) -> None:
+    table = Table(title="Summary")
+    table.add_column("Metric")
+    table.add_column("Count", justify="right")
+    table.add_row("Sites", str(summary.site_count))
+    table.add_row("Site-bound domains", str(summary.site_domain_count))
+    table.add_row("Certificate SAN domains", str(summary.certificate_domain_count))
+    table.add_row("Domains bound in certificate", str(summary.certificate_bound_domain_count))
+    table.add_row("Domains not bound in certificate", str(summary.certificate_unbound_domain_count))
+    if summary.webroot_ok_count or summary.webroot_failed_count:
+        table.add_row("Webroot probe passed", str(summary.webroot_ok_count))
+        table.add_row("Webroot probe failed", str(summary.webroot_failed_count))
+    console.print(table)
+
+
+def render_domain_statuses(statuses: list[DomainBindingStatus], only: str | None = None) -> None:
+    filtered = statuses
+    if only == "bound":
+        filtered = [status for status in statuses if status.certificate_bound]
+    elif only == "unbound":
+        filtered = [status for status in statuses if not status.certificate_bound]
+    elif only == "webroot-ok":
+        filtered = [status for status in statuses if status.webroot_ok is True]
+    elif only == "webroot-failed":
+        filtered = [status for status in statuses if status.webroot_ok is False]
+
+    table = Table(title="Domains")
+    table.add_column("Panel")
+    table.add_column("Site")
+    table.add_column("Domain")
+    table.add_column("Cert")
+    table.add_column("Webroot")
+    table.add_column("Reason")
+    for status in filtered:
+        if status.webroot_ok is True:
+            webroot = "pass"
+        elif status.webroot_ok is False:
+            webroot = "fail"
+        else:
+            webroot = "-"
+        table.add_row(
+            status.panel,
+            status.site,
+            status.domain,
+            "bound" if status.certificate_bound else "unbound",
+            webroot,
+            status.webroot_reason or "-",
+        )
+    console.print(table)
 
 
 def render_renew_results(results) -> None:
@@ -130,12 +189,39 @@ def renew_with_progress(configs: list[PanelConfig], targets: list[SiteInfo], dry
         return renew_all(configs, targets, dry_run=dry_run, progress=on_renew)
 
 
+def probe_with_progress(configs: list[PanelConfig], sites: list[SiteInfo]):
+    with Progress(*progress_columns(), console=console) as progress:
+        task_id = progress.add_task("Probing webroot", total=len(sites))
+
+        def on_probe(event: str, site: SiteInfo, probe: ProbeResult | None) -> None:
+            if event == "site_start":
+                progress.update(task_id, description=f"Probing {site.panel}/{site.name}")
+            elif event == "domain_done" and probe:
+                status = "pass" if probe.ok else "fail"
+                progress.update(task_id, description=f"Probed {site.panel}/{probe.domain}: {status}")
+            elif event == "site_done":
+                progress.advance(task_id)
+
+        return probe_sites(configs, sites, progress=on_probe)
+
+
 def command_scan(args: argparse.Namespace) -> int:
     configs = load_config(args.config)
     result = scan_with_progress(configs)
     render_errors(result.errors)
     render_sites(result.sites)
     return 1 if result.errors and not result.sites else 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    configs = load_config(args.config)
+    scan = scan_with_progress(configs)
+    render_errors(scan.errors)
+    probes = probe_with_progress(configs, scan.sites) if args.probe_webroot else None
+    statuses = build_domain_statuses(scan.sites, probes)
+    render_summary(summarize_statuses(scan.sites, statuses))
+    render_domain_statuses(statuses, only=args.only)
+    return 1 if scan.errors and not scan.sites else 0
 
 
 def command_renew(args: argparse.Namespace) -> int:
@@ -183,6 +269,24 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subparsers.add_parser("scan", help="Scan panels and print SSL status")
     scan.add_argument("--config", default="baota.ini", help="Path to baota.ini")
 
+    status = subparsers.add_parser("status", help="Show certificate and webroot domain status")
+    status.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+    status.add_argument("--probe-webroot", action="store_true", help="Probe each domain's webroot")
+    status.add_argument(
+        "--only",
+        choices=["bound", "unbound", "webroot-ok", "webroot-failed"],
+        help="Filter displayed domains",
+    )
+
+    tui = subparsers.add_parser("tui", help="View summary plus webroot success and failure")
+    tui.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+    tui.add_argument(
+        "--only",
+        choices=["bound", "unbound", "webroot-ok", "webroot-failed"],
+        help="Filter displayed domains",
+    )
+    tui.set_defaults(probe_webroot=True)
+
     renew = subparsers.add_parser("renew", help="Probe webroot and renew all renewable sites")
     renew.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     renew.add_argument("--dry-run", action="store_true", help="Probe only; do not submit renewal")
@@ -196,6 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "scan":
             return command_scan(args)
+        if args.command == "status":
+            return command_status(args)
+        if args.command == "tui":
+            return command_status(args)
         if args.command == "renew":
             return command_renew(args)
         return command_interactive(args)

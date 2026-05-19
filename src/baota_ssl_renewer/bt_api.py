@@ -43,6 +43,42 @@ def _parse_datetime(value: Any) -> datetime | None:
     return None
 
 
+def _normalize_domain(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text.startswith("dns:"):
+        text = text[4:].strip()
+    return text
+
+
+def _split_domain_text(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [_normalize_domain(item) for item in value if _normalize_domain(item)]
+    text = str(value)
+    for separator in ("\n", ";", "|"):
+        text = text.replace(separator, ",")
+    return [_normalize_domain(part) for part in text.split(",") if _normalize_domain(part)]
+
+
+def _extract_ssl_domains(data: dict[str, Any], cert: dict[str, Any]) -> list[str]:
+    domains: list[str] = []
+    keys = (
+        "dns",
+        "domains",
+        "domain",
+        "sans",
+        "san",
+        "subjectAltName",
+        "subject_alt_name",
+        "notAfter_dns",
+    )
+    for source in (cert, data):
+        for key in keys:
+            domains.extend(_split_domain_text(source.get(key)))
+    return sorted(set(domains))
+
+
 class BaotaClient:
     def __init__(self, config: PanelConfig):
         self.config = config
@@ -166,6 +202,7 @@ class BaotaClient:
             provider=str(provider) if provider else None,
             issuer=str(issuer) if issuer else None,
             not_after=_parse_datetime(not_after),
+            domains=_extract_ssl_domains(data, cert),
             raw=data,
         )
 

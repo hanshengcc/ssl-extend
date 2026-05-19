@@ -5,11 +5,12 @@ from ipaddress import ip_address
 from typing import Callable
 
 from .bt_api import BaotaApiError, BaotaClient
-from .models import PanelConfig, ProbeResult, RenewResult, SiteInfo
+from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, StatusSummary
 from .webroot import WebrootProber
 
 ScanProgress = Callable[[str, PanelConfig, SiteInfo | None], None]
 RenewProgress = Callable[[str, SiteInfo, RenewResult | None], None]
+ProbeProgress = Callable[[str, SiteInfo, ProbeResult | None], None]
 
 
 @dataclass
@@ -48,6 +49,90 @@ def should_attempt_renew(site: SiteInfo) -> tuple[bool, str]:
     if not site.domains:
         return False, "site has no domains"
     return True, "ok"
+
+
+def _domain_set(values: list[str]) -> set[str]:
+    return {value.strip().lower() for value in values if value.strip()}
+
+
+def _domain_matches_certificate(host: str, cert_domain: str) -> bool:
+    host = host.lower()
+    cert_domain = cert_domain.lower()
+    if host == cert_domain:
+        return True
+    if not cert_domain.startswith("*."):
+        return False
+    suffix = cert_domain[1:]
+    return host.endswith(suffix) and host.count(".") == cert_domain.count(".")
+
+
+def _domain_bound_by_certificate(host: str, cert_domains: set[str]) -> bool:
+    return any(_domain_matches_certificate(host, cert_domain) for cert_domain in cert_domains)
+
+
+def build_domain_statuses(sites: list[SiteInfo], probes: dict[tuple[str, str, str], ProbeResult] | None = None) -> list[DomainBindingStatus]:
+    statuses: list[DomainBindingStatus] = []
+    probes = probes or {}
+    for site in sites:
+        cert_domains = _domain_set(site.ssl.domains)
+        for domain in site.domains:
+            host = domain.host.lower()
+            probe = probes.get((site.panel, site.name, host))
+            statuses.append(
+                DomainBindingStatus(
+                    panel=site.panel,
+                    site=site.name,
+                    domain=host,
+                    certificate_bound=_domain_bound_by_certificate(host, cert_domains),
+                    webroot_ok=probe.ok if probe else None,
+                    webroot_reason=probe.reason if probe else None,
+                )
+            )
+    return statuses
+
+
+def summarize_statuses(sites: list[SiteInfo], statuses: list[DomainBindingStatus]) -> StatusSummary:
+    site_domain_count = len(statuses)
+    certificate_domain_count = sum(len(_domain_set(site.ssl.domains)) for site in sites)
+    bound_count = sum(1 for status in statuses if status.certificate_bound)
+    unbound_count = site_domain_count - bound_count
+    webroot_ok_count = sum(1 for status in statuses if status.webroot_ok is True)
+    webroot_failed_count = sum(1 for status in statuses if status.webroot_ok is False)
+    return StatusSummary(
+        site_count=len(sites),
+        site_domain_count=site_domain_count,
+        certificate_domain_count=certificate_domain_count,
+        certificate_bound_domain_count=bound_count,
+        certificate_unbound_domain_count=unbound_count,
+        webroot_ok_count=webroot_ok_count,
+        webroot_failed_count=webroot_failed_count,
+    )
+
+
+def probe_sites(
+    configs: list[PanelConfig],
+    sites: list[SiteInfo],
+    progress: ProbeProgress | None = None,
+) -> dict[tuple[str, str, str], ProbeResult]:
+    by_panel = {config.name: config for config in configs}
+    results: dict[tuple[str, str, str], ProbeResult] = {}
+    for site in sites:
+        if progress:
+            progress("site_start", site, None)
+        config = by_panel.get(site.panel)
+        if not config:
+            if progress:
+                progress("site_done", site, None)
+            continue
+        with BaotaClient(config) as client:
+            prober = WebrootProber(client)
+            for probe in prober.probe_site(site):
+                results[(site.panel, site.name, probe.domain.lower())] = probe
+                if progress:
+                    progress("domain_done", site, probe)
+        if progress:
+            progress("site_done", site, None)
+    return results
 
 
 def _is_ip_host(host: str) -> bool:

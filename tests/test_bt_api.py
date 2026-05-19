@@ -37,6 +37,17 @@ def test_client_url_preserves_panel_path_prefix() -> None:
         client.close()
 
 
+def test_normalize_ssl_extracts_certificate_domains() -> None:
+    client = BaotaClient(PanelConfig(name="server1", url="https://panel.example.com", api_key="secret"))
+
+    try:
+        ssl = client._normalize_ssl({"cert_data": {"issuer": "Let's Encrypt", "dns": ["example.com", "www.example.com"]}})
+    finally:
+        client.close()
+
+    assert ssl.domains == ["example.com", "www.example.com"]
+
+
 @respx.mock
 def test_renew_free_ssl_sends_litessl_ca() -> None:
     route = respx.post("https://panel.example.com/ssl?action=renew_lets_ssl").mock(
