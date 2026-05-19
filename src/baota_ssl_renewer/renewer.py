@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .bt_api import BaotaApiError, BaotaClient
 from .models import PanelConfig, ProbeResult, RenewResult, SiteInfo
 from .webroot import WebrootProber
+
+ScanProgress = Callable[[str, PanelConfig, SiteInfo | None], None]
+RenewProgress = Callable[[str, SiteInfo, RenewResult | None], None]
 
 
 @dataclass
@@ -13,14 +17,25 @@ class ScanResult:
     errors: list[str] = field(default_factory=list)
 
 
-def scan_panels(configs: list[PanelConfig]) -> ScanResult:
+def scan_panels(configs: list[PanelConfig], progress: ScanProgress | None = None) -> ScanResult:
     result = ScanResult()
     for config in configs:
+        if progress:
+            progress("panel_start", config, None)
         try:
             with BaotaClient(config) as client:
-                result.sites.extend(client.load_sites())
+                sites = client.load_sites()
+                result.sites.extend(sites)
+                if progress:
+                    for site in sites:
+                        progress("site_loaded", config, site)
+        except BaotaApiError as exc:
+            result.errors.append(str(exc))
         except Exception as exc:  # noqa: BLE001
             result.errors.append(f"{config.name}: {exc}")
+        finally:
+            if progress:
+                progress("panel_done", config, None)
     return result
 
 
@@ -83,15 +98,28 @@ def renew_site(config: PanelConfig, site: SiteInfo, dry_run: bool = False) -> Re
         )
 
 
-def renew_all(configs: list[PanelConfig], sites: list[SiteInfo], dry_run: bool = False) -> list[RenewResult]:
+def renew_all(
+    configs: list[PanelConfig],
+    sites: list[SiteInfo],
+    dry_run: bool = False,
+    progress: RenewProgress | None = None,
+) -> list[RenewResult]:
     by_panel = {config.name: config for config in configs}
     results: list[RenewResult] = []
     for site in sites:
+        if progress:
+            progress("site_start", site, None)
         config = by_panel.get(site.panel)
         if not config:
-            results.append(RenewResult(panel=site.panel, site=site.name, ok=False, message="panel config missing"))
+            result = RenewResult(panel=site.panel, site=site.name, ok=False, message="panel config missing")
+            results.append(result)
+            if progress:
+                progress("site_done", site, result)
             continue
-        results.append(renew_site(config, site, dry_run=dry_run))
+        result = renew_site(config, site, dry_run=dry_run)
+        results.append(result)
+        if progress:
+            progress("site_done", site, result)
     return results
 
 
