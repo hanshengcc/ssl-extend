@@ -217,18 +217,11 @@ class BaotaClient:
         return domains
 
     def get_ssl(self, site: SiteInfo) -> SslInfo:
-        candidates = [
-            ("/site?action=GetSSL", {"siteName": site.name, "id": site.id}),
-            ("/ssl?action=GetSSLInfo", {"siteName": site.name, "id": site.id}),
-        ]
-        last_error: Exception | None = None
-        for path, payload in candidates:
-            try:
-                body = self.post(path, payload)
-                return self._normalize_ssl(body)
-            except Exception as exc:  # noqa: BLE001 - endpoint compatibility probing.
-                last_error = exc
-        return SslInfo(enabled=False, raw={"error": str(last_error) if last_error else "unavailable"})
+        try:
+            body = self.post("/site?action=GetSSL", {"siteName": site.name, "id": site.id})
+            return self._normalize_ssl(body)
+        except Exception as exc:  # noqa: BLE001
+            return SslInfo(enabled=False, raw={"error": str(exc)})
 
     def _normalize_ssl(self, body: Any) -> SslInfo:
         data = body.get("data", body) if isinstance(body, dict) else {}
@@ -285,19 +278,16 @@ class BaotaClient:
         self.post("/files?action=DeleteFile", {"path": path})
 
     def renew_free_ssl(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
-        joined_domains = ",".join(domains)
-        ca_payload = {"ca": ca, "auth_type": "http"}
-        attempts = [
-            (
+        try:
+            body = self.post(
                 "/ssl?action=renew_lets_ssl",
-                {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
-            ),
-            (
-                "/ssl?action=renew_lets_ssl",
-                {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
-            ),
-        ]
-        return self._try_ssl_attempts(attempts, stop_on_no_renewable=True)
+                {"siteName": site.name, "domains": ",".join(domains), "id": site.id, "ca": ca, "auth_type": "http"},
+            )
+        except BaotaApiError as exc:
+            if _looks_no_renewable_certificate_error(str(exc)):
+                raise NoRenewableCertificateError(str(exc)) from exc
+            raise
+        return body if isinstance(body, dict) else {"response": body}
 
     def issue_free_ssl(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
         body = self.apply_cert(site, domains, ca)
@@ -330,33 +320,6 @@ class BaotaClient:
         action = "HttpToHttps" if enabled else "CloseToHttps"
         body = self.post(f"/site?action={action}", {"siteName": site.name, "id": site.id})
         return body if isinstance(body, dict) else {"response": body}
-
-    def _try_ssl_attempts(
-        self,
-        attempts: list[tuple[str, dict[str, Any]]],
-        *,
-        stop_on_no_renewable: bool,
-    ) -> dict[str, Any]:
-        errors: list[str] = []
-        for path, payload in attempts:
-            try:
-                body = self.post(path, payload)
-            except BaotaApiError as exc:
-                if stop_on_no_renewable and _looks_no_renewable_certificate_error(str(exc)):
-                    raise NoRenewableCertificateError(str(exc)) from exc
-                errors.append(str(exc))
-                continue
-            except Exception as exc:  # noqa: BLE001 - try known endpoint variants.
-                errors.append(str(exc))
-                continue
-            if isinstance(body, dict) and body.get("status") is False:
-                msg = str(body.get("msg") or body)
-                if stop_on_no_renewable and _looks_no_renewable_certificate_error(msg):
-                    raise NoRenewableCertificateError(f"{self.config.name}: {msg}")
-                errors.append(msg)
-                continue
-            return body if isinstance(body, dict) else {"response": body}
-        raise BaotaApiError("; ".join(errors) or "renew endpoint unavailable")
 
     def renew_lets_ssl(self, site: SiteInfo, domains: list[str]) -> dict[str, Any]:
         return self.renew_free_ssl(site, domains, "letsencrypt")
