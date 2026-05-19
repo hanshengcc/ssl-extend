@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urljoin
 
 import httpx
@@ -167,7 +167,7 @@ class BaotaClient:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
-            raise BaotaApiError(f"{self.config.name}: HTTP {response.status_code} for {path}") from exc
+            raise BaotaApiError(f"{self.config.name}: HTTP {response.status_code} for {response.url}") from exc
 
         try:
             body = response.json()
@@ -256,11 +256,13 @@ class BaotaClient:
         )
 
     def load_sites(self) -> list[SiteInfo]:
-        sites = self.list_sites()
-        for site in sites:
+        return list(self.iter_sites())
+
+    def iter_sites(self) -> Iterator[SiteInfo]:
+        for site in self.list_sites():
             site.domains = self.list_domains(site.id)
             site.ssl = self.get_ssl(site)
-        return sites
+            yield site
 
     def save_file(self, path: str, body: str) -> None:
         self.post("/files?action=SaveFileBody", {"path": path, "data": body, "encoding": "utf-8"})

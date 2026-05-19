@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from ipaddress import ip_address
-from typing import Callable
+from typing import Callable, Iterator
 
 from .bt_api import BaotaApiError, BaotaClient, NoRenewableCertificateError
 from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
@@ -360,6 +360,45 @@ def apply_sites_sequential(
         if progress:
             progress("site_done", site, result)
     return results
+
+
+def scan_and_apply_sequential(
+    configs: list[PanelConfig],
+    dry_run: bool = False,
+    progress: RenewProgress | None = None,
+) -> tuple[list[RenewResult], list[str]]:
+    """Stream scan → probe → renew: each site is processed as soon as its metadata is ready."""
+    results: list[RenewResult] = []
+    errors: list[str] = []
+    for config in configs:
+        try:
+            with BaotaClient(config) as client:
+                for site in client.iter_sites():
+                    if not should_attempt_renew(site)[0]:
+                        continue
+                    if progress:
+                        progress("site_start", site, None)
+                    try:
+                        result = renew_site(config, site, dry_run=dry_run)
+                    except FatalProgramError as exc:
+                        result = RenewResult(
+                            panel=config.name,
+                            site=site.name,
+                            ok=False,
+                            message=f"fatal program/API error: {exc}",
+                        )
+                        results.append(result)
+                        if progress:
+                            progress("site_done", site, result)
+                        return results, errors
+                    results.append(result)
+                    if progress:
+                        progress("site_done", site, result)
+        except BaotaApiError as exc:
+            errors.append(str(exc))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{config.name}: {exc}")
+    return results, errors
 
 
 def summarize_skips(probes: list[ProbeResult]) -> str:

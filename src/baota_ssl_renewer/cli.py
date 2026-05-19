@@ -12,11 +12,11 @@ from rich.table import Table
 from .config import load_config
 from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
 from .renewer import (
-    apply_sites_sequential,
     build_domain_statuses,
     plan_sites,
     probe_sites,
     renew_all,
+    scan_and_apply_sequential,
     scan_panels,
     set_https_all,
     should_attempt_renew,
@@ -217,20 +217,26 @@ def renew_with_progress(
         return renew_all(configs, targets, dry_run=dry_run, progress=on_renew, probes=probes)
 
 
-def apply_sequential_with_progress(configs: list[PanelConfig], targets: list[SiteInfo], dry_run: bool):
+def scan_and_apply_with_progress(configs: list[PanelConfig], dry_run: bool):
     action = "Planning" if dry_run else "Applying"
-    with Progress(*progress_columns(), console=console) as progress:
-        task_id = progress.add_task(f"{action} sites", total=len(targets))
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TextColumn("{task.completed} done"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task(f"{action}...", total=None)
 
         def on_apply(event: str, site: SiteInfo, result: RenewResult | None) -> None:
             if event == "site_start":
                 progress.update(task_id, description=f"{action} {site.panel}/{site.name}")
             elif event == "site_done":
                 status = "ok" if result and result.ok else "failed"
-                progress.update(task_id, description=f"{action} {site.panel}/{site.name}: {status}")
+                progress.update(task_id, description=f"{site.panel}/{site.name}: {status}")
                 progress.advance(task_id)
 
-        return apply_sites_sequential(configs, targets, dry_run=dry_run, progress=on_apply)
+        return scan_and_apply_sequential(configs, dry_run=dry_run, progress=on_apply)
 
 
 def https_with_progress(configs: list[PanelConfig], sites: list[SiteInfo], enabled: bool, dry_run: bool):
@@ -305,20 +311,18 @@ def command_cert_plan(args: argparse.Namespace) -> int:
 
 def command_renew(args: argparse.Namespace) -> int:
     configs = load_config(args.config)
-    scan = scan_with_progress(configs)
-    render_errors(scan.errors)
-    render_sites(scan.sites)
-    targets = [site for site in scan.sites if should_attempt_renew(site)[0]]
-    if not targets:
-        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
-        return 1
     if args.dry_run:
         console.print("[cyan]Dry-run mode: each site will be preflighted and planned without submitting changes.[/]")
     else:
         console.print("[cyan]Applying certificate plan one site at a time.[/]")
-    results = apply_sequential_with_progress(configs, targets, dry_run=args.dry_run)
-    render_renew_results(results)
-    return 0 if all(result.ok for result in results) else 1
+    results, errors = scan_and_apply_with_progress(configs, dry_run=args.dry_run)
+    render_errors(errors)
+    if not results and not errors:
+        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
+        return 1
+    if results:
+        render_renew_results(results)
+    return 0 if results and all(result.ok for result in results) else 1
 
 
 def command_https(args: argparse.Namespace) -> int:
