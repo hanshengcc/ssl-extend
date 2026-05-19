@@ -53,6 +53,22 @@ def test_should_attempt_renew_allows_litessl() -> None:
     assert reason == "ok"
 
 
+def test_should_attempt_renew_allows_sites_without_ssl() -> None:
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com")],
+        ssl=SslInfo(enabled=False),
+    )
+
+    allowed, reason = should_attempt_renew(site)
+
+    assert allowed is True
+    assert reason == "ok"
+
+
 def test_litessl_skips_ip_domains() -> None:
     site = SiteInfo(
         panel="p",
@@ -128,7 +144,7 @@ def test_renew_site_dry_run_uses_preflight_probe_results() -> None:
 
     assert result.ok is True
     assert result.included_domains == ["example.com"]
-    assert result.message == "dry-run: renewal not submitted"
+    assert result.message == "dry-run: would issue certificate"
 
 
 def test_renew_site_issues_new_certificate_when_no_renewable(monkeypatch) -> None:

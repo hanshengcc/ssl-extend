@@ -5,7 +5,7 @@ from ipaddress import ip_address
 from typing import Callable
 
 from .bt_api import BaotaApiError, BaotaClient, NoRenewableCertificateError
-from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, StatusSummary
+from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
 from .webroot import WebrootProber
 
 ScanProgress = Callable[[str, PanelConfig, SiteInfo | None], None]
@@ -42,12 +42,12 @@ def scan_panels(configs: list[PanelConfig], progress: ScanProgress | None = None
 
 
 def should_attempt_renew(site: SiteInfo) -> tuple[bool, str]:
-    if not site.ssl.enabled:
-        return False, "SSL is not enabled or status is unavailable"
-    if not site.ssl.is_supported_free_ca:
-        return False, "not a supported free certificate provider"
     if not site.domains:
         return False, "site has no domains"
+    if not site.ssl.enabled:
+        return True, "ok"
+    if not site.ssl.is_supported_free_ca:
+        return False, "not a supported free certificate provider"
     return True, "ok"
 
 
@@ -161,6 +161,45 @@ def _any_valid_domain_unbound(site: SiteInfo, domains: list[str]) -> bool:
     return any(not _domain_bound_by_certificate(domain, cert_domains) for domain in domains)
 
 
+def plan_site(site: SiteInfo, probes: list[ProbeResult]) -> SitePlan:
+    allowed, reason = should_attempt_renew(site)
+    if not allowed:
+        return SitePlan(panel=site.panel, site=site.name, action="skip", message=reason)
+    valid_domains, provider_skipped = _filter_provider_domains(site, [probe.domain for probe in probes if probe.ok])
+    skipped = [probe for probe in probes if not probe.ok]
+    skipped.extend(provider_skipped)
+    if not valid_domains:
+        return SitePlan(
+            panel=site.panel,
+            site=site.name,
+            action="skip",
+            message="no domain passed webroot probe",
+            skipped_domains=skipped,
+        )
+    action = "issue" if _any_valid_domain_unbound(site, valid_domains) else "renew"
+    message = "issue certificate for accessible uncovered domains" if action == "issue" else "renew existing certificate"
+    return SitePlan(
+        panel=site.panel,
+        site=site.name,
+        action=action,
+        message=message,
+        included_domains=valid_domains,
+        skipped_domains=skipped,
+    )
+
+
+def plan_sites(sites: list[SiteInfo], probes: dict[tuple[str, str, str], ProbeResult]) -> list[SitePlan]:
+    plans: list[SitePlan] = []
+    for site in sites:
+        site_probes = [
+            probe
+            for domain in site.domains
+            if (probe := probes.get((site.panel, site.name, domain.host.lower()))) is not None
+        ]
+        plans.append(plan_site(site, site_probes))
+    return plans
+
+
 def renew_site(
     config: PanelConfig,
     site: SiteInfo,
@@ -187,11 +226,12 @@ def renew_site(
                 skipped_domains=skipped,
             )
         if dry_run:
+            action = "issue" if _any_valid_domain_unbound(site, valid_domains) else "renew"
             return RenewResult(
                 panel=config.name,
                 site=site.name,
                 ok=True,
-                message="dry-run: renewal not submitted",
+                message=f"dry-run: would {action} certificate",
                 included_domains=valid_domains,
                 skipped_domains=skipped,
             )
@@ -265,3 +305,39 @@ def summarize_skips(probes: list[ProbeResult]) -> str:
     if not probes:
         return ""
     return "; ".join(f"{probe.domain}: {probe.reason}" for probe in probes)
+
+
+def set_https_all(
+    configs: list[PanelConfig],
+    sites: list[SiteInfo],
+    enabled: bool,
+    dry_run: bool = False,
+    progress: RenewProgress | None = None,
+) -> list[RenewResult]:
+    by_panel = {config.name: config for config in configs}
+    results: list[RenewResult] = []
+    for site in sites:
+        if progress:
+            progress("site_start", site, None)
+        config = by_panel.get(site.panel)
+        if not config:
+            result = RenewResult(panel=site.panel, site=site.name, ok=False, message="panel config missing")
+        elif dry_run:
+            action = "enable force HTTPS" if enabled else "disable force HTTPS"
+            result = RenewResult(panel=site.panel, site=site.name, ok=True, message=f"dry-run: would {action}")
+        else:
+            try:
+                with BaotaClient(config) as client:
+                    body = client.set_force_https(site, enabled)
+                result = RenewResult(
+                    panel=site.panel,
+                    site=site.name,
+                    ok=True,
+                    message=str(body.get("msg") or body.get("message") or "updated"),
+                )
+            except BaotaApiError as exc:
+                result = RenewResult(panel=site.panel, site=site.name, ok=False, message=str(exc))
+        results.append(result)
+        if progress:
+            progress("site_done", site, result)
+    return results

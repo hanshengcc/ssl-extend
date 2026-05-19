@@ -10,12 +10,14 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeEl
 from rich.table import Table
 
 from .config import load_config
-from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, StatusSummary
+from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
 from .renewer import (
     build_domain_statuses,
+    plan_sites,
     probe_sites,
     renew_all,
     scan_panels,
+    set_https_all,
     should_attempt_renew,
     summarize_skips,
     summarize_statuses,
@@ -148,6 +150,26 @@ def render_renew_results(results) -> None:
     console.print(table)
 
 
+def render_site_plans(plans: list[SitePlan]) -> None:
+    table = Table(title="Certificate Plan")
+    table.add_column("Panel")
+    table.add_column("Site")
+    table.add_column("Action")
+    table.add_column("Included domains")
+    table.add_column("Skipped domains")
+    table.add_column("Message")
+    for plan in plans:
+        table.add_row(
+            plan.panel,
+            plan.site,
+            plan.action,
+            "\n".join(plan.included_domains) or "-",
+            summarize_skips(plan.skipped_domains) or "-",
+            plan.message,
+        )
+    console.print(table)
+
+
 def progress_columns() -> tuple[SpinnerColumn, TextColumn, BarColumn, TextColumn, TimeElapsedColumn]:
     return (
         SpinnerColumn(),
@@ -194,6 +216,22 @@ def renew_with_progress(
         return renew_all(configs, targets, dry_run=dry_run, progress=on_renew, probes=probes)
 
 
+def https_with_progress(configs: list[PanelConfig], sites: list[SiteInfo], enabled: bool, dry_run: bool):
+    action = "Enabling HTTPS" if enabled else "Disabling HTTPS"
+    with Progress(*progress_columns(), console=console) as progress:
+        task_id = progress.add_task(action, total=len(sites))
+
+        def on_https(event: str, site: SiteInfo, result: RenewResult | None) -> None:
+            if event == "site_start":
+                progress.update(task_id, description=f"{action} {site.panel}/{site.name}")
+            elif event == "site_done":
+                status = "ok" if result and result.ok else "failed"
+                progress.update(task_id, description=f"{action} {site.panel}/{site.name}: {status}")
+                progress.advance(task_id)
+
+        return set_https_all(configs, sites, enabled=enabled, dry_run=dry_run, progress=on_https)
+
+
 def probe_with_progress(configs: list[PanelConfig], sites: list[SiteInfo]):
     with Progress(*progress_columns(), console=console) as progress:
         task_id = progress.add_task("Probing webroot", total=len(sites))
@@ -229,6 +267,25 @@ def command_status(args: argparse.Namespace) -> int:
     return 1 if scan.errors and not scan.sites else 0
 
 
+def command_cert_plan(args: argparse.Namespace) -> int:
+    configs = load_config(args.config)
+    scan = scan_with_progress(configs)
+    render_errors(scan.errors)
+    targets = [site for site in scan.sites if should_attempt_renew(site)[0]]
+    if not targets:
+        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
+        return 1
+    console.print("[cyan]Running webroot preflight for certificate plan.[/]")
+    probes = probe_with_progress(configs, targets)
+    statuses = build_domain_statuses(targets, probes)
+    summary = summarize_statuses(targets, statuses)
+    render_summary(summary)
+    if summary.webroot_failed_count:
+        render_domain_statuses(statuses, only="webroot-failed")
+    render_site_plans(plan_sites(targets, probes))
+    return 1 if scan.errors and not scan.sites else 0
+
+
 def command_renew(args: argparse.Namespace) -> int:
     configs = load_config(args.config)
     scan = scan_with_progress(configs)
@@ -238,19 +295,37 @@ def command_renew(args: argparse.Namespace) -> int:
     if not targets:
         console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
         return 1
-    console.print("[cyan]Running webroot preflight before renewal.[/]")
+    console.print("[cyan]Running webroot preflight before certificate apply.[/]")
     probes = probe_with_progress(configs, targets)
     statuses = build_domain_statuses(targets, probes)
     summary = summarize_statuses(targets, statuses)
     render_summary(summary)
     if summary.webroot_failed_count:
         render_domain_statuses(statuses, only="webroot-failed")
+    render_site_plans(plan_sites(targets, probes))
     if summary.webroot_ok_count == 0:
         console.print("[red]No domain passed webroot preflight. Renewal skipped.[/]")
         return 1
     if args.dry_run:
         console.print("[cyan]Dry-run mode: probing webroot only; renewal requests will not be submitted.[/]")
     results = renew_with_progress(configs, targets, dry_run=args.dry_run, probes=probes)
+    render_renew_results(results)
+    return 0 if all(result.ok for result in results) else 1
+
+
+def command_https(args: argparse.Namespace) -> int:
+    configs = load_config(args.config)
+    scan = scan_with_progress(configs)
+    render_errors(scan.errors)
+    if not scan.sites:
+        console.print("[red]No sites loaded.[/]")
+        return 1
+    enabled = args.https_command == "enable"
+    action = "enable force HTTPS" if enabled else "disable force HTTPS"
+    if not args.dry_run and not args.yes and not Confirm.ask(f"Batch {action} for {len(scan.sites)} site(s)?", default=False):
+        console.print("Cancelled.")
+        return 0
+    results = https_with_progress(configs, scan.sites, enabled=enabled, dry_run=args.dry_run)
     render_renew_results(results)
     return 0 if all(result.ok for result in results) else 1
 
@@ -294,6 +369,33 @@ def build_parser() -> argparse.ArgumentParser:
     scan = subparsers.add_parser("scan", help="Scan panels and print SSL status")
     scan.add_argument("--config", default="baota.ini", help="Path to baota.ini")
 
+    cert = subparsers.add_parser("cert", help="Certificate operations")
+    cert_subparsers = cert.add_subparsers(dest="cert_command")
+
+    cert_status = cert_subparsers.add_parser("status", help="Show certificate and domain status")
+    cert_status.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+    cert_status.add_argument("--probe-webroot", action="store_true", help="Probe each domain's webroot")
+    cert_status.add_argument(
+        "--only",
+        choices=["bound", "unbound", "webroot-ok", "webroot-failed"],
+        help="Filter displayed domains",
+    )
+
+    cert_plan = cert_subparsers.add_parser("plan", help="Preflight domains and show renew/issue plan")
+    cert_plan.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+
+    cert_apply = cert_subparsers.add_parser("apply", help="Apply certificate plan")
+    cert_apply.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+    cert_apply.add_argument("--dry-run", action="store_true", help="Preflight and show plan only")
+
+    https = subparsers.add_parser("https", help="Batch force HTTPS operations")
+    https_subparsers = https.add_subparsers(dest="https_command")
+    for command_name in ("enable", "disable"):
+        https_cmd = https_subparsers.add_parser(command_name, help=f"{command_name.title()} force HTTPS for all sites")
+        https_cmd.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+        https_cmd.add_argument("--dry-run", action="store_true", help="Show target sites without changing them")
+        https_cmd.add_argument("--yes", action="store_true", help="Skip confirmation")
+
     status = subparsers.add_parser("status", help="Show certificate and webroot domain status")
     status.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     status.add_argument("--probe-webroot", action="store_true", help="Probe each domain's webroot")
@@ -325,6 +427,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "scan":
             return command_scan(args)
+        if args.command == "cert":
+            if args.cert_command == "status":
+                return command_status(args)
+            if args.cert_command == "plan":
+                return command_cert_plan(args)
+            if args.cert_command == "apply":
+                return command_renew(args)
+            return command_cert_plan(args)
+        if args.command == "https":
+            if args.https_command in {"enable", "disable"}:
+                return command_https(args)
+            console.print("[red]Error:[/] missing https command: enable or disable")
+            return 1
         if args.command == "status":
             return command_status(args)
         if args.command == "tui":

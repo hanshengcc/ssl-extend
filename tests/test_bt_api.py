@@ -97,9 +97,12 @@ def test_renew_free_ssl_stops_when_no_renewable_certificate() -> None:
 
 
 @respx.mock
-def test_issue_free_ssl_uses_createlet_endpoint() -> None:
-    route = respx.post("https://panel.example.com/ssl?action=CreateLet").mock(
-        return_value=Response(200, json={"status": True, "msg": "issued"})
+def test_issue_free_ssl_applies_cert_then_sets_ssl() -> None:
+    apply_route = respx.post("https://panel.example.com/acme?action=apply_cert_api").mock(
+        return_value=Response(200, json={"status": True, "cert": "CERT", "key": "KEY"})
+    )
+    setssl_route = respx.post("https://panel.example.com/site?action=SetSSL").mock(
+        return_value=Response(200, json={"status": True, "msg": "saved"})
     )
     client = BaotaClient(PanelConfig(name="server1", url="https://panel.example.com", api_key="secret"))
 
@@ -112,8 +115,35 @@ def test_issue_free_ssl_uses_createlet_endpoint() -> None:
     finally:
         client.close()
 
-    assert body["msg"] == "issued"
-    request_body = route.calls.last.request.content.decode()
-    assert "siteName=example.com" in request_body
-    assert "domains=example.com%2Cwww.example.com" in request_body
-    assert "auth_type=http" in request_body
+    assert body["msg"] == "certificate issued and installed"
+    apply_body = apply_route.calls.last.request.content.decode()
+    assert "domains=%5B%22example.com%22%2C%22www.example.com%22%5D" in apply_body
+    assert "auth_type=http" in apply_body
+    assert "auto_to=7" in apply_body
+    assert "auto_wildcard=0" in apply_body
+    assert "id=7" in apply_body
+    setssl_body = setssl_route.calls.last.request.content.decode()
+    assert "siteName=example.com" in setssl_body
+    assert "key=KEY" in setssl_body
+    assert "csr=CERT" in setssl_body
+
+
+@respx.mock
+def test_set_force_https_enable_and_disable() -> None:
+    enable_route = respx.post("https://panel.example.com/site?action=HttpToHttps").mock(
+        return_value=Response(200, json={"status": True, "msg": "enabled"})
+    )
+    disable_route = respx.post("https://panel.example.com/site?action=CloseToHttps").mock(
+        return_value=Response(200, json={"status": True, "msg": "disabled"})
+    )
+    client = BaotaClient(PanelConfig(name="server1", url="https://panel.example.com", api_key="secret"))
+    site = SiteInfo(panel="server1", id=7, name="example.com", path="/www/wwwroot/example.com")
+
+    try:
+        assert client.set_force_https(site, True)["msg"] == "enabled"
+        assert client.set_force_https(site, False)["msg"] == "disabled"
+    finally:
+        client.close()
+
+    assert "siteName=example.com" in enable_route.calls.last.request.content.decode()
+    assert "siteName=example.com" in disable_route.calls.last.request.content.decode()

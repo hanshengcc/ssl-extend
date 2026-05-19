@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from datetime import datetime
 from typing import Any
@@ -100,6 +101,31 @@ def _looks_no_renewable_certificate_error(message: str) -> bool:
             "not renewable",
         )
     )
+
+
+def _find_first_value(data: Any, keys: set[str]) -> str | None:
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key.lower() in keys and value:
+                return str(value)
+        for value in data.values():
+            found = _find_first_value(value, keys)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _find_first_value(item, keys)
+            if found:
+                return found
+    return None
+
+
+def _extract_cert_pair(body: Any) -> tuple[str, str]:
+    key = _find_first_value(body, {"key", "private_key", "privkey", "ssl_key"})
+    cert = _find_first_value(body, {"cert", "certificate", "fullchain", "full_chain", "pem", "csr"})
+    if not key or not cert:
+        raise BaotaApiError("ACME response did not include certificate and private key")
+    return cert, key
 
 
 class BaotaClient:
@@ -272,27 +298,36 @@ class BaotaClient:
         return self._try_ssl_attempts(attempts, stop_on_no_renewable=True)
 
     def issue_free_ssl(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
-        joined_domains = ",".join(domains)
-        ca_payload = {"ca": ca, "auth_type": "http", "auth_to": site.id}
-        attempts = [
-            (
-                "/ssl?action=CreateLet",
-                {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
-            ),
-            (
-                "/ssl?action=CreateLet",
-                {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
-            ),
-            (
-                "/site?action=CreateLet",
-                {"siteName": site.name, "domains": joined_domains, "id": site.id, **ca_payload},
-            ),
-            (
-                "/site?action=CreateLet",
-                {"siteName": site.name, "domain": joined_domains, "id": site.id, **ca_payload},
-            ),
-        ]
-        return self._try_ssl_attempts(attempts, stop_on_no_renewable=False)
+        body = self.apply_cert(site, domains, ca)
+        cert, key = _extract_cert_pair(body)
+        setssl_body = self.set_ssl(site, cert=cert, key=key)
+        return {"status": True, "msg": "certificate issued and installed", "apply": body, "set_ssl": setssl_body}
+
+    def apply_cert(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
+        body = self.post(
+            "/acme?action=apply_cert_api",
+            {
+                "domains": json.dumps(domains, ensure_ascii=False, separators=(",", ":")),
+                "auth_type": "http",
+                "auto_to": site.id,
+                "auto_wildcard": 0,
+                "id": site.id,
+                "ca": ca,
+            },
+        )
+        return body if isinstance(body, dict) else {"response": body}
+
+    def set_ssl(self, site: SiteInfo, cert: str, key: str) -> dict[str, Any]:
+        body = self.post(
+            "/site?action=SetSSL",
+            {"type": -1, "siteName": site.name, "key": key, "csr": cert},
+        )
+        return body if isinstance(body, dict) else {"response": body}
+
+    def set_force_https(self, site: SiteInfo, enabled: bool) -> dict[str, Any]:
+        action = "HttpToHttps" if enabled else "CloseToHttps"
+        body = self.post(f"/site?action={action}", {"siteName": site.name, "id": site.id})
+        return body if isinstance(body, dict) else {"response": body}
 
     def _try_ssl_attempts(
         self,

@@ -97,6 +97,16 @@ class RenewResult:
     skipped_domains: list[ProbeResult] = field(default_factory=list)
 
 
+@dataclass
+class SitePlan:
+    panel: str
+    site: str
+    action: str
+    message: str
+    included_domains: list[str] = field(default_factory=list)
+    skipped_domains: list[ProbeResult] = field(default_factory=list)
+
+
 @dataclass(frozen=True)
 class DomainBindingStatus:
     panel: str
