@@ -4,11 +4,13 @@ import hashlib
 import json
 import time
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any, Iterator
 from urllib.parse import urljoin
 
 import httpx
 
+from .acme_client import ACME_DIRECTORY_URLS, AcmeClient, AcmeError
 from .models import DomainInfo, PanelConfig, SiteInfo, SslInfo
 
 
@@ -296,18 +298,33 @@ class BaotaClient:
         return {"status": True, "msg": "certificate issued and installed", "apply": body, "set_ssl": setssl_body}
 
     def apply_cert(self, site: SiteInfo, domains: list[str], ca: str) -> dict[str, Any]:
-        body = self.post(
-            "/acme?action=apply_cert_api",
-            {
-                "domains": json.dumps(domains, ensure_ascii=False, separators=(",", ":")),
-                "auth_type": "http",
-                "auto_to": site.id,
-                "auto_wildcard": 0,
-                "id": site.id,
-                "ca": ca,
-            },
-        )
-        return body if isinstance(body, dict) else {"response": body}
+        if not site.path:
+            raise BaotaApiError(f"{self.config.name}: site {site.name!r} has no webroot path configured")
+
+        directory_url = ACME_DIRECTORY_URLS.get(ca.lower(), ACME_DIRECTORY_URLS["letsencrypt"])
+        site_path = site.path
+
+        def _challenge_file(token: str) -> str:
+            return str(PurePosixPath(site_path) / ".well-known" / "acme-challenge" / token)
+
+        def place_challenge(_domain: str, token: str, key_auth: str) -> None:
+            well_known = str(PurePosixPath(site_path) / ".well-known")
+            challenge_dir = str(PurePosixPath(well_known) / "acme-challenge")
+            self.create_dir(well_known)
+            self.create_dir(challenge_dir)
+            self.create_file(_challenge_file(token))
+            self.save_file(_challenge_file(token), key_auth)
+
+        def remove_challenge(_domain: str, token: str) -> None:
+            self.delete_file(_challenge_file(token))
+
+        try:
+            with AcmeClient(directory_url) as acme:
+                cert_pem, key_pem = acme.issue_certificate(domains, place_challenge, remove_challenge)
+        except AcmeError as exc:
+            raise BaotaApiError(f"{self.config.name}: ACME certificate issuance failed: {exc}") from exc
+
+        return {"cert": cert_pem, "key": key_pem}
 
     def set_ssl(self, site: SiteInfo, cert: str, key: str) -> dict[str, Any]:
         body = self.post(

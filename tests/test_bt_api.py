@@ -1,4 +1,5 @@
 import hashlib
+from unittest.mock import patch
 
 import respx
 from httpx import Response
@@ -98,30 +99,21 @@ def test_renew_free_ssl_stops_when_no_renewable_certificate() -> None:
 
 @respx.mock
 def test_issue_free_ssl_applies_cert_then_sets_ssl() -> None:
-    apply_route = respx.post("https://panel.example.com/acme?action=apply_cert_api").mock(
-        return_value=Response(200, json={"status": True, "cert": "CERT", "key": "KEY"})
-    )
     setssl_route = respx.post("https://panel.example.com/site?action=SetSSL").mock(
         return_value=Response(200, json={"status": True, "msg": "saved"})
     )
     client = BaotaClient(PanelConfig(name="server1", url="https://panel.example.com", api_key="secret"))
+    site = SiteInfo(panel="server1", id=7, name="example.com", path="/www/wwwroot/example.com")
+    domains = ["example.com", "www.example.com"]
 
-    try:
-        body = client.issue_free_ssl(
-            SiteInfo(panel="server1", id=7, name="example.com", path="/www/wwwroot/example.com"),
-            ["example.com", "www.example.com"],
-            "letsencrypt",
-        )
-    finally:
-        client.close()
+    with patch.object(client, "apply_cert", return_value={"cert": "CERT", "key": "KEY"}) as mock_apply:
+        try:
+            body = client.issue_free_ssl(site, domains, "letsencrypt")
+        finally:
+            client.close()
 
     assert body["msg"] == "certificate issued and installed"
-    apply_body = apply_route.calls.last.request.content.decode()
-    assert "domains=%5B%22example.com%22%2C%22www.example.com%22%5D" in apply_body
-    assert "auth_type=http" in apply_body
-    assert "auto_to=7" in apply_body
-    assert "auto_wildcard=0" in apply_body
-    assert "id=7" in apply_body
+    mock_apply.assert_called_once_with(site, domains, "letsencrypt")
     setssl_body = setssl_route.calls.last.request.content.decode()
     assert "siteName=example.com" in setssl_body
     assert "key=KEY" in setssl_body
