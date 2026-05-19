@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 
 import httpx
@@ -21,11 +22,19 @@ class WebrootProber:
         self.client = client
         self.timeout = timeout
 
-    def probe_site(self, site: SiteInfo) -> list[ProbeResult]:
-        results: list[ProbeResult] = []
-        for domain in site.domains:
-            results.append(self.probe_domain(site, domain))
-        return results
+    def probe_site(self, site: SiteInfo, domain_filter: set[str] | None = None) -> list[ProbeResult]:
+        domains = [d for d in site.domains if domain_filter is None or d.host.lower() in domain_filter]
+        if len(domains) <= 1:
+            return [self.probe_domain(site, d) for d in domains]
+        config = self.client.config
+        timeout = self.timeout
+
+        def _probe_one(domain: DomainInfo) -> ProbeResult:
+            with BaotaClient(config) as client:
+                return WebrootProber(client, timeout).probe_domain(site, domain)
+
+        with ThreadPoolExecutor(max_workers=min(len(domains), 5)) as executor:
+            return list(executor.map(_probe_one, domains))
 
     def probe_domain(self, site: SiteInfo, domain: DomainInfo) -> ProbeResult:
         host = domain.host

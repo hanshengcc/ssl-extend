@@ -217,7 +217,7 @@ def renew_with_progress(
         return renew_all(configs, targets, dry_run=dry_run, progress=on_renew, probes=probes)
 
 
-def scan_and_apply_with_progress(configs: list[PanelConfig], dry_run: bool):
+def scan_and_apply_with_progress(configs: list[PanelConfig], dry_run: bool, domain_filter: set[str] | None = None):
     action = "Planning" if dry_run else "Applying"
     with Progress(
         SpinnerColumn(),
@@ -236,7 +236,7 @@ def scan_and_apply_with_progress(configs: list[PanelConfig], dry_run: bool):
                 progress.update(task_id, description=f"{site.panel}/{site.name}: {status}")
                 progress.advance(task_id)
 
-        return scan_and_apply_sequential(configs, dry_run=dry_run, progress=on_apply)
+        return scan_and_apply_sequential(configs, dry_run=dry_run, progress=on_apply, domain_filter=domain_filter)
 
 
 def https_with_progress(configs: list[PanelConfig], sites: list[SiteInfo], enabled: bool, dry_run: bool):
@@ -315,7 +315,8 @@ def command_renew(args: argparse.Namespace) -> int:
         console.print("[cyan]Dry-run mode: each site will be preflighted and planned without submitting changes.[/]")
     else:
         console.print("[cyan]Applying certificate plan one site at a time.[/]")
-    results, errors = scan_and_apply_with_progress(configs, dry_run=args.dry_run)
+    domain_filter = {d.strip().lower() for d in args.domains.split(",")} if getattr(args, "domains", None) else None
+    results, errors = scan_and_apply_with_progress(configs, dry_run=args.dry_run, domain_filter=domain_filter)
     render_errors(errors)
     if not results and not errors:
         console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
@@ -399,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     cert_apply = cert_subparsers.add_parser("apply", help="Apply certificate plan")
     cert_apply.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     cert_apply.add_argument("--dry-run", action="store_true", help="Preflight and show plan only")
+    cert_apply.add_argument("--domains", help="Comma-separated domains to include (default: all accessible)")
 
     https = subparsers.add_parser("https", help="Batch force HTTPS operations")
     https_subparsers = https.add_subparsers(dest="https_command")
@@ -429,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     renew = subparsers.add_parser("renew", help="Probe webroot and renew all renewable sites")
     renew.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     renew.add_argument("--dry-run", action="store_true", help="Probe only; do not submit renewal")
+    renew.add_argument("--domains", help="Comma-separated domains to include (default: all accessible)")
     return parser
 
 

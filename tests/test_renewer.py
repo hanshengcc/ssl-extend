@@ -239,7 +239,7 @@ def test_apply_sites_sequential_continues_after_site_failure(monkeypatch) -> Non
         def __init__(self, _client):
             pass
 
-        def probe_site(self, site):
+        def probe_site(self, site, domain_filter=None):
             return [ProbeResult(domain=domain.host, ok=True, reason="ok") for domain in site.domains]
 
     class FakeClient:
@@ -300,7 +300,7 @@ def test_apply_sites_sequential_stops_after_fatal_program_error(monkeypatch) -> 
         def __init__(self, _client):
             pass
 
-        def probe_site(self, site):
+        def probe_site(self, site, domain_filter=None):
             return [ProbeResult(domain=domain.host, ok=True, reason="ok") for domain in site.domains]
 
     class FakeClient:

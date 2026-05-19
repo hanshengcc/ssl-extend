@@ -227,6 +227,7 @@ def renew_site(
     site: SiteInfo,
     dry_run: bool = False,
     probes: list[ProbeResult] | None = None,
+    domain_filter: set[str] | None = None,
 ) -> RenewResult:
     allowed, reason = should_attempt_renew(site)
     if not allowed:
@@ -235,7 +236,7 @@ def renew_site(
     with BaotaClient(config) as client:
         if probes is None:
             prober = WebrootProber(client)
-            probes = prober.probe_site(site)
+            probes = prober.probe_site(site, domain_filter=domain_filter)
         valid_domains, provider_skipped = _filter_provider_domains(site, [probe.domain for probe in probes if probe.ok])
         skipped = [probe for probe in probes if not probe.ok]
         skipped.extend(provider_skipped)
@@ -366,6 +367,7 @@ def scan_and_apply_sequential(
     configs: list[PanelConfig],
     dry_run: bool = False,
     progress: RenewProgress | None = None,
+    domain_filter: set[str] | None = None,
 ) -> tuple[list[RenewResult], list[str]]:
     """Stream scan → probe → renew: each site is processed as soon as its metadata is ready."""
     results: list[RenewResult] = []
@@ -374,12 +376,14 @@ def scan_and_apply_sequential(
         try:
             with BaotaClient(config) as client:
                 for site in client.iter_sites():
+                    if domain_filter and not any(d.host.lower() in domain_filter for d in site.domains):
+                        continue
                     if not should_attempt_renew(site)[0]:
                         continue
                     if progress:
                         progress("site_start", site, None)
                     try:
-                        result = renew_site(config, site, dry_run=dry_run)
+                        result = renew_site(config, site, dry_run=dry_run, domain_filter=domain_filter)
                     except FatalProgramError as exc:
                         result = RenewResult(
                             panel=config.name,
