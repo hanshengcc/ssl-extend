@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import time
 from typing import Callable
@@ -15,8 +16,16 @@ from cryptography.x509.oid import NameOID
 
 ACME_DIRECTORY_URLS: dict[str, str] = {
     "letsencrypt": "https://acme-v02.api.letsencrypt.org/directory",
+    "letsencrypt-staging": "https://acme-staging-v02.api.letsencrypt.org/directory",
     "litessl": "https://acme-v02.api.letsencrypt.org/directory",
+    "buypass": "https://api.buypass.com/acme/directory",
+    "buypass-staging": "https://api.test4.buypass.no/acme/directory",
+    "zerossl": "https://acme.zerossl.com/v2/DV90",
+    "google": "https://dv.acme-v02.api.pki.goog/directory",
+    "sslcom": "https://acme.ssl.com/sslcom-dv-rsa",
 }
+
+ACME_PROVIDERS_REQUIRING_EAB: set[str] = {"zerossl", "google", "sslcom"}
 
 
 class AcmeError(RuntimeError):
@@ -25,6 +34,11 @@ class AcmeError(RuntimeError):
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
 
 
 def _jwk(key: ec.EllipticCurvePrivateKey) -> dict:
@@ -66,8 +80,16 @@ def _build_csr(domains: list[str], key: ec.EllipticCurvePrivateKey) -> bytes:
 
 
 class AcmeClient:
-    def __init__(self, directory_url: str, timeout: float = 30.0):
+    def __init__(
+        self,
+        directory_url: str,
+        timeout: float = 30.0,
+        eab_kid: str | None = None,
+        eab_hmac_key: str | None = None,
+    ):
         self.directory_url = directory_url
+        self.eab_kid = eab_kid
+        self.eab_hmac_key = eab_hmac_key
         self._http = httpx.Client(timeout=timeout, follow_redirects=True)
         self._directory: dict | None = None
         self._nonce: str | None = None
@@ -123,9 +145,29 @@ class AcmeClient:
             raise AcmeError(f"ACME {resp.status_code}: {detail}")
         return data
 
+    def _external_account_binding(self, new_account_url: str) -> dict:
+        if not self.eab_kid or not self.eab_hmac_key:
+            raise AcmeError("External Account Binding is required but acme_eab_kid/acme_eab_hmac_key is missing")
+        protected = _b64url(
+            json.dumps(
+                {"alg": "HS256", "kid": self.eab_kid, "url": new_account_url},
+                separators=(",", ":"),
+            ).encode()
+        )
+        payload = _b64url(json.dumps(_jwk(self._account_key), separators=(",", ":")).encode())
+        try:
+            hmac_key = _b64url_decode(self.eab_hmac_key)
+        except Exception:
+            hmac_key = self.eab_hmac_key.encode()
+        signature = hmac.new(hmac_key, f"{protected}.{payload}".encode(), hashlib.sha256).digest()
+        return {"protected": protected, "payload": payload, "signature": _b64url(signature)}
+
     def _register(self) -> None:
         directory = self._get_directory()
-        resp = self._post(directory["newAccount"], {"termsOfServiceAgreed": True}, use_jwk=True)
+        payload = {"termsOfServiceAgreed": True}
+        if self.eab_kid or self.eab_hmac_key:
+            payload["externalAccountBinding"] = self._external_account_binding(directory["newAccount"])
+        resp = self._post(directory["newAccount"], payload, use_jwk=True)
         if replay_nonce := resp.headers.get("Replay-Nonce"):
             self._nonce = replay_nonce
         if resp.status_code not in (200, 201):

@@ -16,6 +16,11 @@ verify_ssl = false
 url = https://b.example.com:8888
 api_key = key-b
 timeout = 3
+default_ca = buypass
+ca_fallbacks = letsencrypt, zerossl
+acme_directory_url = https://acme.example.com/directory
+acme_eab_kid = kid
+acme_eab_hmac_key = hmac-key
 """.strip(),
         encoding="utf-8",
     )
@@ -26,3 +31,8 @@ timeout = 3
     assert panels[0].url == "https://a.example.com:8888"
     assert panels[0].verify_ssl is False
     assert panels[1].timeout == 3
+    assert panels[1].default_ca == "buypass"
+    assert panels[1].ca_fallbacks == ("letsencrypt", "zerossl")
+    assert panels[1].acme_directory_url == "https://acme.example.com/directory"
+    assert panels[1].acme_eab_kid == "kid"
+    assert panels[1].acme_eab_hmac_key == "hmac-key"

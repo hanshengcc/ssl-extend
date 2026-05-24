@@ -17,13 +17,18 @@ def _join_remote(*parts: str) -> str:
     return str(path)
 
 
+def _domain_in_filter(host: str, domain_filter: set[str]) -> bool:
+    host = host.strip().lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in domain_filter)
+
+
 class WebrootProber:
     def __init__(self, client: BaotaClient, timeout: float = 10.0):
         self.client = client
         self.timeout = timeout
 
     def probe_site(self, site: SiteInfo, domain_filter: set[str] | None = None) -> list[ProbeResult]:
-        domains = [d for d in site.domains if domain_filter is None or d.host.lower() in domain_filter]
+        domains = [d for d in site.domains if domain_filter is None or _domain_in_filter(d.host, domain_filter)]
         if len(domains) <= 1:
             return [self.probe_domain(site, d) for d in domains]
         config = self.client.config

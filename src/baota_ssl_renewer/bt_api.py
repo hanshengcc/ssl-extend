@@ -10,7 +10,7 @@ from urllib.parse import urljoin
 
 import httpx
 
-from .acme_client import ACME_DIRECTORY_URLS, AcmeClient, AcmeError
+from .acme_client import ACME_DIRECTORY_URLS, ACME_PROVIDERS_REQUIRING_EAB, AcmeClient, AcmeError
 from .models import DomainInfo, PanelConfig, SiteInfo, SslInfo
 
 
@@ -301,7 +301,17 @@ class BaotaClient:
         if not site.path:
             raise BaotaApiError(f"{self.config.name}: site {site.name!r} has no webroot path configured")
 
-        directory_url = ACME_DIRECTORY_URLS.get(ca.lower(), ACME_DIRECTORY_URLS["letsencrypt"])
+        ca_name = ca.lower()
+        directory_url = self.config.acme_directory_url or ACME_DIRECTORY_URLS.get(ca_name)
+        if not directory_url:
+            supported = ", ".join(sorted(ACME_DIRECTORY_URLS))
+            raise BaotaApiError(f"{self.config.name}: unsupported ACME CA {ca!r}. Supported: {supported}")
+        if ca_name in ACME_PROVIDERS_REQUIRING_EAB and (
+            not self.config.acme_eab_kid or not self.config.acme_eab_hmac_key
+        ):
+            raise BaotaApiError(
+                f"{self.config.name}: {ca_name} requires acme_eab_kid and acme_eab_hmac_key in baota.ini"
+            )
         site_path = site.path
 
         def _challenge_file(token: str) -> str:
@@ -319,7 +329,11 @@ class BaotaClient:
             self.delete_file(_challenge_file(token))
 
         try:
-            with AcmeClient(directory_url) as acme:
+            with AcmeClient(
+                directory_url,
+                eab_kid=self.config.acme_eab_kid,
+                eab_hmac_key=self.config.acme_eab_hmac_key,
+            ) as acme:
                 cert_pem, key_pem = acme.issue_certificate(domains, place_challenge, remove_challenge)
         except AcmeError as exc:
             raise BaotaApiError(f"{self.config.name}: ACME certificate issuance failed: {exc}") from exc

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from ipaddress import ip_address
 from typing import Callable, Iterator
 
+from .acme_client import ACME_DIRECTORY_URLS
 from .bt_api import BaotaApiError, BaotaClient, NoRenewableCertificateError
 from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
 from .webroot import WebrootProber
@@ -11,6 +12,8 @@ from .webroot import WebrootProber
 ScanProgress = Callable[[str, PanelConfig, SiteInfo | None], None]
 RenewProgress = Callable[[str, SiteInfo, RenewResult | None], None]
 ProbeProgress = Callable[[str, SiteInfo, ProbeResult | None], None]
+
+DEFAULT_CA_FALLBACK_ORDER = ("buypass", "letsencrypt", "litessl", "zerossl", "google", "sslcom")
 
 
 class FatalProgramError(RuntimeError):
@@ -57,6 +60,11 @@ def should_attempt_renew(site: SiteInfo) -> tuple[bool, str]:
 
 def _domain_set(values: list[str]) -> set[str]:
     return {value.strip().lower() for value in values if value.strip()}
+
+
+def _domain_in_filter(host: str, domain_filter: set[str]) -> bool:
+    host = host.strip().lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in domain_filter)
 
 
 def _domain_matches_certificate(host: str, cert_domain: str) -> bool:
@@ -183,6 +191,78 @@ def _is_fatal_program_error(exc: Exception) -> bool:
     return any(marker in message for marker in fatal_markers)
 
 
+def _is_ca_rate_limit_error(exc: Exception) -> bool:
+    if not isinstance(exc, BaotaApiError):
+        return False
+    message = str(exc).lower()
+    rate_limit_markers = (
+        "429",
+        "rate limit",
+        "rate limited",
+        "too many certificates",
+        "too many orders",
+        "too many requests",
+        "too many failed authorizations",
+        "retry-after",
+        "限速",
+        "频率",
+        "配额",
+        "次数过多",
+        "请求过多",
+    )
+    return any(marker in message for marker in rate_limit_markers)
+
+
+def _default_ca_fallbacks(primary_ca: str, config: PanelConfig) -> list[str]:
+    if config.ca_fallbacks:
+        return list(config.ca_fallbacks)
+    return [
+        ca
+        for ca in DEFAULT_CA_FALLBACK_ORDER
+        if ca != primary_ca and ca in ACME_DIRECTORY_URLS
+    ]
+
+
+def _ca_candidates(primary: str | None, site: SiteInfo, config: PanelConfig, ca_fallbacks: list[str] | None) -> list[str]:
+    primary_ca = (primary or site.ssl.renewable_ca or config.default_ca).strip().lower()
+    fallback_candidates = ca_fallbacks if ca_fallbacks is not None else _default_ca_fallbacks(primary_ca, config)
+    candidates = [primary_ca, *fallback_candidates]
+    ordered: list[str] = []
+    for candidate in candidates:
+        ca = candidate.strip().lower()
+        if ca and ca not in ordered:
+            ordered.append(ca)
+    return ordered or ["letsencrypt"]
+
+
+def _apply_with_ca_fallbacks(
+    client: BaotaClient,
+    site: SiteInfo,
+    valid_domains: list[str],
+    candidates: list[str],
+) -> tuple[dict, str, str, list[str]]:
+    attempts: list[str] = []
+    should_issue = _any_valid_domain_unbound(site, valid_domains)
+    for index, candidate in enumerate(candidates):
+        try:
+            if should_issue:
+                body = client.issue_free_ssl(site, valid_domains, candidate)
+                return body, "issue", candidate, attempts
+            try:
+                body = client.renew_free_ssl(site, valid_domains, candidate)
+                return body, "renew", candidate, attempts
+            except NoRenewableCertificateError:
+                body = client.issue_free_ssl(site, valid_domains, candidate)
+                return body, "issue", candidate, attempts
+        except Exception as exc:  # noqa: BLE001
+            if _is_fatal_program_error(exc):
+                raise FatalProgramError(str(exc)) from exc
+            if not _is_ca_rate_limit_error(exc) or index == len(candidates) - 1:
+                raise
+            attempts.append(f"{candidate}: {exc}")
+    raise BaotaApiError("no ACME CA candidate was attempted")
+
+
 def plan_site(site: SiteInfo, probes: list[ProbeResult]) -> SitePlan:
     allowed, reason = should_attempt_renew(site)
     if not allowed:
@@ -228,6 +308,8 @@ def renew_site(
     dry_run: bool = False,
     probes: list[ProbeResult] | None = None,
     domain_filter: set[str] | None = None,
+    ca: str | None = None,
+    ca_fallbacks: list[str] | None = None,
 ) -> RenewResult:
     allowed, reason = should_attempt_renew(site)
     if not allowed:
@@ -259,18 +341,15 @@ def renew_site(
                 skipped_domains=skipped,
             )
         try:
-            ca = site.ssl.renewable_ca or "letsencrypt"
-            if _any_valid_domain_unbound(site, valid_domains):
-                body = client.issue_free_ssl(site, valid_domains, ca)
-                action = "issue"
-            else:
-                try:
-                    body = client.renew_free_ssl(site, valid_domains, ca)
-                    action = "renew"
-                except NoRenewableCertificateError:
-                    body = client.issue_free_ssl(site, valid_domains, ca)
-                    action = "issue"
+            body, action, selected_ca, ca_attempts = _apply_with_ca_fallbacks(
+                client,
+                site,
+                valid_domains,
+                _ca_candidates(ca, site, config, ca_fallbacks),
+            )
         except Exception as exc:  # noqa: BLE001 - classify batch-fatal API/logic errors separately.
+            if isinstance(exc, FatalProgramError):
+                raise
             if _is_fatal_program_error(exc):
                 raise FatalProgramError(str(exc)) from exc
             return RenewResult(
@@ -283,6 +362,8 @@ def renew_site(
             )
         default_message = "certificate issue request submitted" if action == "issue" else "renew request submitted"
         message = str(body.get("msg") or body.get("message") or default_message)
+        if ca_attempts:
+            message = f"{message} (CA fallback: {' -> '.join([attempt.split(':', 1)[0] for attempt in ca_attempts] + [selected_ca])})"
         return RenewResult(
             panel=config.name,
             site=site.name,
@@ -368,6 +449,8 @@ def scan_and_apply_sequential(
     dry_run: bool = False,
     progress: RenewProgress | None = None,
     domain_filter: set[str] | None = None,
+    ca: str | None = None,
+    ca_fallbacks: list[str] | None = None,
 ) -> tuple[list[RenewResult], list[str]]:
     """Stream scan → probe → renew: each site is processed as soon as its metadata is ready."""
     results: list[RenewResult] = []
@@ -376,14 +459,21 @@ def scan_and_apply_sequential(
         try:
             with BaotaClient(config) as client:
                 for site in client.iter_sites():
-                    if domain_filter and not any(d.host.lower() in domain_filter for d in site.domains):
+                    if domain_filter and not any(_domain_in_filter(d.host, domain_filter) for d in site.domains):
                         continue
                     if not should_attempt_renew(site)[0]:
                         continue
                     if progress:
                         progress("site_start", site, None)
                     try:
-                        result = renew_site(config, site, dry_run=dry_run, domain_filter=domain_filter)
+                        result = renew_site(
+                            config,
+                            site,
+                            dry_run=dry_run,
+                            domain_filter=domain_filter,
+                            ca=ca,
+                            ca_fallbacks=ca_fallbacks,
+                        )
                     except FatalProgramError as exc:
                         result = RenewResult(
                             panel=config.name,

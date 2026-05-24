@@ -6,7 +6,7 @@ from httpx import Response
 
 import pytest
 
-from baota_ssl_renewer.bt_api import NoRenewableCertificateError, baota_token
+from baota_ssl_renewer.bt_api import BaotaApiError, NoRenewableCertificateError, baota_token
 from baota_ssl_renewer.bt_api import BaotaClient
 from baota_ssl_renewer.models import PanelConfig, SiteInfo
 
@@ -118,6 +118,17 @@ def test_issue_free_ssl_applies_cert_then_sets_ssl() -> None:
     assert "siteName=example.com" in setssl_body
     assert "key=KEY" in setssl_body
     assert "csr=CERT" in setssl_body
+
+
+def test_apply_cert_requires_eab_for_eab_providers() -> None:
+    client = BaotaClient(PanelConfig(name="server1", url="https://panel.example.com", api_key="secret"))
+    site = SiteInfo(panel="server1", id=7, name="example.com", path="/www/wwwroot/example.com")
+
+    try:
+        with pytest.raises(BaotaApiError, match="requires acme_eab_kid"):
+            client.apply_cert(site, ["example.com"], "zerossl")
+    finally:
+        client.close()
 
 
 @respx.mock

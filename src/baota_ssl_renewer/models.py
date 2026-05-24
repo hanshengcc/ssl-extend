@@ -11,6 +11,11 @@ class PanelConfig:
     api_key: str
     verify_ssl: bool = True
     timeout: float = 15.0
+    default_ca: str = "letsencrypt"
+    ca_fallbacks: tuple[str, ...] = ()
+    acme_directory_url: str | None = None
+    acme_eab_kid: str | None = None
+    acme_eab_hmac_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -46,15 +51,33 @@ class SslInfo:
         ]
         return " ".join(str(v).lower() for v in (self.provider, self.issuer, *raw_values) if v)
 
+    def _contains_provider(self, *markers: str) -> bool:
+        values = self._provider_text()
+        return any(marker in values for marker in markers)
+
     @property
     def is_lets_encrypt(self) -> bool:
-        values = self._provider_text()
-        return "let's encrypt" in values or "lets encrypt" in values or "letsencrypt" in values
+        return self._contains_provider("let's encrypt", "lets encrypt", "letsencrypt")
 
     @property
     def is_litessl(self) -> bool:
-        values = self._provider_text()
-        return "litessl" in values or "trustasia" in values or "trust asia" in values
+        return self._contains_provider("litessl", "trustasia", "trust asia")
+
+    @property
+    def is_zerossl(self) -> bool:
+        return self._contains_provider("zerossl", "zero ssl")
+
+    @property
+    def is_buypass(self) -> bool:
+        return self._contains_provider("buypass", "buypass go")
+
+    @property
+    def is_google_trust_services(self) -> bool:
+        return self._contains_provider("google trust services", "gts", "google")
+
+    @property
+    def is_sslcom(self) -> bool:
+        return self._contains_provider("ssl.com", "sslcom")
 
     @property
     def renewable_ca(self) -> str | None:
@@ -62,6 +85,14 @@ class SslInfo:
             return "litessl"
         if self.is_lets_encrypt:
             return "letsencrypt"
+        if self.is_zerossl:
+            return "zerossl"
+        if self.is_buypass:
+            return "buypass"
+        if self.is_google_trust_services:
+            return "google"
+        if self.is_sslcom:
+            return "sslcom"
         return None
 
     @property

@@ -53,6 +53,30 @@ def test_should_attempt_renew_allows_litessl() -> None:
     assert reason == "ok"
 
 
+def test_should_attempt_renew_allows_more_free_acme_providers() -> None:
+    providers = [
+        ("ZeroSSL", "zerossl"),
+        ("Buypass Go SSL", "buypass"),
+        ("Google Trust Services", "google"),
+        ("SSL.com", "sslcom"),
+    ]
+    for provider, expected_ca in providers:
+        site = SiteInfo(
+            panel="p",
+            id=1,
+            name="example.com",
+            path="/www/wwwroot/example.com",
+            domains=[DomainInfo("example.com")],
+            ssl=SslInfo(enabled=True, provider=provider),
+        )
+
+        allowed, reason = should_attempt_renew(site)
+
+        assert allowed is True
+        assert reason == "ok"
+        assert site.ssl.renewable_ca == expected_ca
+
+
 def test_should_attempt_renew_allows_sites_without_ssl() -> None:
     site = SiteInfo(
         panel="p",
@@ -232,6 +256,165 @@ def test_renew_site_issues_new_certificate_when_valid_domain_is_unbound(monkeypa
     assert result.ok is True
     assert result.message == "issued:example.com,www.example.com"
     assert result.included_domains == ["example.com", "www.example.com"]
+
+
+def test_renew_site_uses_panel_default_ca_for_new_certificate(monkeypatch) -> None:
+    class FakeClient:
+        selected_ca = None
+
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def issue_free_ssl(self, _site, _domains, ca):
+            self.selected_ca = ca
+            return {"status": True, "msg": f"issued:{ca}"}
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com")],
+        ssl=SslInfo(enabled=False),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret", default_ca="buypass"),
+        site,
+        probes=[ProbeResult(domain="example.com", ok=True, reason="ok")],
+    )
+
+    assert result.ok is True
+    assert result.message == "issued:buypass"
+
+
+def test_renew_site_falls_back_to_next_ca_on_rate_limit(monkeypatch) -> None:
+    class FakeClient:
+        attempts = []
+
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def issue_free_ssl(self, _site, _domains, ca):
+            self.attempts.append(ca)
+            if ca == "letsencrypt":
+                raise BaotaApiError("server1: ACME 429: rate limited")
+            return {"status": True, "msg": f"issued:{ca}"}
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com")],
+        ssl=SslInfo(enabled=False),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret"),
+        site,
+        probes=[ProbeResult(domain="example.com", ok=True, reason="ok")],
+        ca="letsencrypt",
+        ca_fallbacks=["buypass"],
+    )
+
+    assert result.ok is True
+    assert result.message == "issued:buypass (CA fallback: letsencrypt -> buypass)"
+    assert FakeClient.attempts == ["letsencrypt", "buypass"]
+
+
+def test_renew_site_uses_default_fallbacks_when_not_configured(monkeypatch) -> None:
+    class FakeClient:
+        attempts = []
+
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def issue_free_ssl(self, _site, _domains, ca):
+            self.attempts.append(ca)
+            if ca == "letsencrypt":
+                raise BaotaApiError("server1: ACME 429: rate limited")
+            return {"status": True, "msg": f"issued:{ca}"}
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com")],
+        ssl=SslInfo(enabled=False),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret", default_ca="letsencrypt"),
+        site,
+        probes=[ProbeResult(domain="example.com", ok=True, reason="ok")],
+    )
+
+    assert result.ok is True
+    assert result.message == "issued:buypass (CA fallback: letsencrypt -> buypass)"
+    assert FakeClient.attempts == ["letsencrypt", "buypass"]
+
+
+def test_renew_site_does_not_fallback_on_non_rate_limit_error(monkeypatch) -> None:
+    class FakeClient:
+        attempts = []
+
+        def __init__(self, _config):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def issue_free_ssl(self, _site, _domains, ca):
+            self.attempts.append(ca)
+            raise BaotaApiError("server1: domain validation failed")
+
+    monkeypatch.setattr("baota_ssl_renewer.renewer.BaotaClient", FakeClient)
+    site = SiteInfo(
+        panel="p",
+        id=1,
+        name="example.com",
+        path="/www/wwwroot/example.com",
+        domains=[DomainInfo("example.com")],
+        ssl=SslInfo(enabled=False),
+    )
+
+    result = renew_site(
+        PanelConfig(name="p", url="https://panel.example.com", api_key="secret"),
+        site,
+        probes=[ProbeResult(domain="example.com", ok=True, reason="ok")],
+        ca="letsencrypt",
+        ca_fallbacks=["buypass"],
+    )
+
+    assert result.ok is False
+    assert "domain validation failed" in result.message
+    assert FakeClient.attempts == ["letsencrypt"]
 
 
 def test_apply_sites_sequential_continues_after_site_failure(monkeypatch) -> None:

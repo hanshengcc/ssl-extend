@@ -9,6 +9,7 @@ from rich.prompt import Confirm
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
+from .acme_client import ACME_DIRECTORY_URLS
 from .config import load_config
 from .models import DomainBindingStatus, PanelConfig, ProbeResult, RenewResult, SiteInfo, SitePlan, StatusSummary
 from .renewer import (
@@ -43,11 +44,65 @@ def _domains(site: SiteInfo) -> str:
     return "\n".join(hosts[:5]) + ("\n..." if len(hosts) > 5 else "")
 
 
+def _parse_domain_filter(args: argparse.Namespace) -> set[str] | None:
+    values: list[str] = []
+    if getattr(args, "domains", None):
+        values.append(args.domains)
+    values.extend(getattr(args, "domain", None) or [])
+    domains = {
+        part.strip().lower().removeprefix("*.").rstrip(".")
+        for value in values
+        for part in value.split(",")
+        if part.strip()
+    }
+    return domains or None
+
+
+def _parse_ca_fallbacks(args: argparse.Namespace) -> list[str] | None:
+    values = getattr(args, "ca_fallback", None) or []
+    fallbacks = [part.strip().lower() for value in values for part in value.split(",") if part.strip()]
+    return fallbacks or None
+
+
+def _domain_matches_filter(host: str, domain_filter: set[str]) -> bool:
+    host = host.strip().lower().removeprefix("*.").rstrip(".")
+    return any(host == domain or host.endswith(f".{domain}") for domain in domain_filter)
+
+
+def _filter_sites_by_domain(sites: list[SiteInfo], domain_filter: set[str] | None) -> list[SiteInfo]:
+    if not domain_filter:
+        return sites
+    filtered: list[SiteInfo] = []
+    for site in sites:
+        domains = [domain for domain in site.domains if _domain_matches_filter(domain.host, domain_filter)]
+        if not domains:
+            continue
+        filtered.append(
+            SiteInfo(
+                panel=site.panel,
+                id=site.id,
+                name=site.name,
+                path=site.path,
+                domains=domains,
+                ssl=site.ssl,
+            )
+        )
+    return filtered
+
+
 def _ssl_state(site: SiteInfo) -> str:
     if site.ssl.is_litessl:
         return "LiteSSL"
     if site.ssl.is_lets_encrypt:
         return "LE"
+    if site.ssl.is_zerossl:
+        return "ZeroSSL"
+    if site.ssl.is_buypass:
+        return "Buypass"
+    if site.ssl.is_google_trust_services:
+        return "Google"
+    if site.ssl.is_sslcom:
+        return "SSL.com"
     return site.ssl.provider or site.ssl.issuer or "-"
 
 
@@ -143,7 +198,7 @@ def render_renew_results(results) -> None:
         table.add_row(
             result.panel,
             result.site,
-            "ok" if result.ok else "failed",
+            "[green]ok[/]" if result.ok else "[red]failed[/]",
             "\n".join(result.included_domains) or "-",
             summarize_skips(result.skipped_domains) or "-",
             result.message,
@@ -171,19 +226,21 @@ def render_site_plans(plans: list[SitePlan]) -> None:
     console.print(table)
 
 
-def progress_columns() -> tuple[SpinnerColumn, TextColumn, BarColumn, TextColumn, TimeElapsedColumn]:
+def progress_columns() -> tuple[SpinnerColumn, TextColumn, BarColumn, TextColumn, TextColumn, TimeElapsedColumn]:
     return (
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
+        BarColumn(complete_style="green", finished_style="green"),
+        TextColumn("[cyan]{task.completed}/{task.total}[/]"),
+        TextColumn("[green]{task.fields[ok]} ok[/] [red]{task.fields[failed]} failed[/]"),
         TimeElapsedColumn(),
     )
 
 
 def scan_with_progress(configs: list[PanelConfig]):
     with Progress(*progress_columns(), console=console) as progress:
-        task_id = progress.add_task("Scanning panels", total=len(configs))
+        task_id = progress.add_task("Scanning panels", total=len(configs), ok=0, failed=0)
+        counters = {"ok": 0, "failed": 0}
 
         def on_scan(event: str, config: PanelConfig, site: SiteInfo | None) -> None:
             if event == "panel_start":
@@ -191,6 +248,8 @@ def scan_with_progress(configs: list[PanelConfig]):
             elif event == "site_loaded" and site:
                 progress.update(task_id, description=f"Loaded {config.name}/{site.name}")
             elif event == "panel_done":
+                counters["ok"] += 1
+                progress.update(task_id, ok=counters["ok"], failed=counters["failed"])
                 progress.advance(task_id)
 
         return scan_panels(configs, progress=on_scan)
@@ -204,52 +263,81 @@ def renew_with_progress(
 ):
     action = "Probing" if dry_run else "Renewing"
     with Progress(*progress_columns(), console=console) as progress:
-        task_id = progress.add_task(f"{action} sites", total=len(targets))
+        task_id = progress.add_task(f"{action} sites", total=len(targets), ok=0, failed=0)
+        counters = {"ok": 0, "failed": 0}
 
         def on_renew(event: str, site: SiteInfo, result: RenewResult | None) -> None:
             if event == "site_start":
                 progress.update(task_id, description=f"{action} {site.panel}/{site.name}")
             elif event == "site_done":
                 status = "ok" if result and result.ok else "failed"
-                progress.update(task_id, description=f"{action} {site.panel}/{site.name}: {status}")
+                counters["ok" if result and result.ok else "failed"] += 1
+                progress.update(
+                    task_id,
+                    description=f"{action} {site.panel}/{site.name}: {status}",
+                    ok=counters["ok"],
+                    failed=counters["failed"],
+                )
                 progress.advance(task_id)
 
         return renew_all(configs, targets, dry_run=dry_run, progress=on_renew, probes=probes)
 
 
-def scan_and_apply_with_progress(configs: list[PanelConfig], dry_run: bool, domain_filter: set[str] | None = None):
+def scan_and_apply_with_progress(
+    configs: list[PanelConfig],
+    dry_run: bool,
+    domain_filter: set[str] | None = None,
+    ca: str | None = None,
+    ca_fallbacks: list[str] | None = None,
+):
     action = "Planning" if dry_run else "Applying"
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TextColumn("{task.completed} done"),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task_id = progress.add_task(f"{action}...", total=None)
+    with Progress(*progress_columns(), console=console) as progress:
+        task_id = progress.add_task(f"{action}...", total=0, ok=0, failed=0)
+        counters = {"ok": 0, "failed": 0, "total": 0}
 
         def on_apply(event: str, site: SiteInfo, result: RenewResult | None) -> None:
             if event == "site_start":
-                progress.update(task_id, description=f"{action} {site.panel}/{site.name}")
+                counters["total"] += 1
+                progress.update(task_id, total=counters["total"], description=f"{action} {site.panel}/{site.name}")
             elif event == "site_done":
                 status = "ok" if result and result.ok else "failed"
-                progress.update(task_id, description=f"{site.panel}/{site.name}: {status}")
+                counters["ok" if result and result.ok else "failed"] += 1
+                progress.update(
+                    task_id,
+                    description=f"{site.panel}/{site.name}: {status}",
+                    ok=counters["ok"],
+                    failed=counters["failed"],
+                )
                 progress.advance(task_id)
 
-        return scan_and_apply_sequential(configs, dry_run=dry_run, progress=on_apply, domain_filter=domain_filter)
+        return scan_and_apply_sequential(
+            configs,
+            dry_run=dry_run,
+            progress=on_apply,
+            domain_filter=domain_filter,
+            ca=ca,
+            ca_fallbacks=ca_fallbacks,
+        )
 
 
 def https_with_progress(configs: list[PanelConfig], sites: list[SiteInfo], enabled: bool, dry_run: bool):
     action = "Enabling HTTPS" if enabled else "Disabling HTTPS"
     with Progress(*progress_columns(), console=console) as progress:
-        task_id = progress.add_task(action, total=len(sites))
+        task_id = progress.add_task(action, total=len(sites), ok=0, failed=0)
+        counters = {"ok": 0, "failed": 0}
 
         def on_https(event: str, site: SiteInfo, result: RenewResult | None) -> None:
             if event == "site_start":
                 progress.update(task_id, description=f"{action} {site.panel}/{site.name}")
             elif event == "site_done":
                 status = "ok" if result and result.ok else "failed"
-                progress.update(task_id, description=f"{action} {site.panel}/{site.name}: {status}")
+                counters["ok" if result and result.ok else "failed"] += 1
+                progress.update(
+                    task_id,
+                    description=f"{action} {site.panel}/{site.name}: {status}",
+                    ok=counters["ok"],
+                    failed=counters["failed"],
+                )
                 progress.advance(task_id)
 
         return set_https_all(configs, sites, enabled=enabled, dry_run=dry_run, progress=on_https)
@@ -257,7 +345,8 @@ def https_with_progress(configs: list[PanelConfig], sites: list[SiteInfo], enabl
 
 def probe_with_progress(configs: list[PanelConfig], sites: list[SiteInfo]):
     with Progress(*progress_columns(), console=console) as progress:
-        task_id = progress.add_task("Probing webroot", total=len(sites))
+        task_id = progress.add_task("Probing webroot", total=len(sites), ok=0, failed=0)
+        counters = {"ok": 0, "failed": 0}
 
         def on_probe(event: str, site: SiteInfo, probe: ProbeResult | None) -> None:
             if event == "site_start":
@@ -266,6 +355,8 @@ def probe_with_progress(configs: list[PanelConfig], sites: list[SiteInfo]):
                 status = "pass" if probe.ok else "fail"
                 progress.update(task_id, description=f"Probed {site.panel}/{probe.domain}: {status}")
             elif event == "site_done":
+                counters["ok"] += 1
+                progress.update(task_id, ok=counters["ok"], failed=counters["failed"])
                 progress.advance(task_id)
 
         return probe_sites(configs, sites, progress=on_probe)
@@ -283,9 +374,10 @@ def command_status(args: argparse.Namespace) -> int:
     configs = load_config(args.config)
     scan = scan_with_progress(configs)
     render_errors(scan.errors)
-    probes = probe_with_progress(configs, scan.sites) if args.probe_webroot else None
-    statuses = build_domain_statuses(scan.sites, probes)
-    render_summary(summarize_statuses(scan.sites, statuses))
+    sites = _filter_sites_by_domain(scan.sites, _parse_domain_filter(args))
+    probes = probe_with_progress(configs, sites) if args.probe_webroot else None
+    statuses = build_domain_statuses(sites, probes)
+    render_summary(summarize_statuses(sites, statuses))
     render_domain_statuses(statuses, only=args.only)
     return 1 if scan.errors and not scan.sites else 0
 
@@ -294,9 +386,10 @@ def command_cert_plan(args: argparse.Namespace) -> int:
     configs = load_config(args.config)
     scan = scan_with_progress(configs)
     render_errors(scan.errors)
-    targets = [site for site in scan.sites if should_attempt_renew(site)[0]]
+    sites = _filter_sites_by_domain(scan.sites, _parse_domain_filter(args))
+    targets = [site for site in sites if should_attempt_renew(site)[0]]
     if not targets:
-        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
+        console.print("[yellow]No renewable supported free-CA sites found.[/]")
         return 1
     console.print("[cyan]Running webroot preflight for certificate plan.[/]")
     probes = probe_with_progress(configs, targets)
@@ -315,11 +408,17 @@ def command_renew(args: argparse.Namespace) -> int:
         console.print("[cyan]Dry-run mode: each site will be preflighted and planned without submitting changes.[/]")
     else:
         console.print("[cyan]Applying certificate plan one site at a time.[/]")
-    domain_filter = {d.strip().lower() for d in args.domains.split(",")} if getattr(args, "domains", None) else None
-    results, errors = scan_and_apply_with_progress(configs, dry_run=args.dry_run, domain_filter=domain_filter)
+    domain_filter = _parse_domain_filter(args)
+    results, errors = scan_and_apply_with_progress(
+        configs,
+        dry_run=args.dry_run,
+        domain_filter=domain_filter,
+        ca=args.ca,
+        ca_fallbacks=_parse_ca_fallbacks(args),
+    )
     render_errors(errors)
     if not results and not errors:
-        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
+        console.print("[yellow]No renewable supported free-CA sites found.[/]")
         return 1
     if results:
         render_renew_results(results)
@@ -353,7 +452,7 @@ def command_interactive(args: argparse.Namespace) -> int:
     render_sites(scan.sites)
     targets = [site for site in scan.sites if should_attempt_renew(site)[0]]
     if not targets:
-        console.print("[yellow]No renewable Let's Encrypt or LiteSSL sites found.[/]")
+        console.print("[yellow]No renewable supported free-CA sites found.[/]")
         return 1
     console.print(f"[cyan]Ready to renew {len(targets)} site(s). Webroot probing will run before each renewal.[/]")
     if not Confirm.ask("一键续签全部可续签站点?", default=False):
@@ -388,6 +487,8 @@ def build_parser() -> argparse.ArgumentParser:
     cert_status = cert_subparsers.add_parser("status", help="Show certificate and domain status")
     cert_status.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     cert_status.add_argument("--probe-webroot", action="store_true", help="Probe each domain's webroot")
+    cert_status.add_argument("--domain", action="append", help="Filter by domain; can be repeated or comma-separated")
+    cert_status.add_argument("--domains", help="Comma-separated domains to filter")
     cert_status.add_argument(
         "--only",
         choices=["bound", "unbound", "webroot-ok", "webroot-failed"],
@@ -396,11 +497,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     cert_plan = cert_subparsers.add_parser("plan", help="Preflight domains and show renew/issue plan")
     cert_plan.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+    cert_plan.add_argument("--domain", action="append", help="Filter by domain; can be repeated or comma-separated")
+    cert_plan.add_argument("--domains", help="Comma-separated domains to filter")
 
     cert_apply = cert_subparsers.add_parser("apply", help="Apply certificate plan")
     cert_apply.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     cert_apply.add_argument("--dry-run", action="store_true", help="Preflight and show plan only")
+    cert_apply.add_argument("--domain", action="append", help="Include matching domain; can be repeated or comma-separated")
     cert_apply.add_argument("--domains", help="Comma-separated domains to include (default: all accessible)")
+    cert_apply.add_argument(
+        "--ca",
+        help=f"ACME CA for new certificates. Built-ins: {', '.join(sorted(ACME_DIRECTORY_URLS))}",
+    )
+    cert_apply.add_argument(
+        "--ca-fallback",
+        action="append",
+        help="Fallback CA when the current CA is rate-limited; can be repeated or comma-separated",
+    )
 
     https = subparsers.add_parser("https", help="Batch force HTTPS operations")
     https_subparsers = https.add_subparsers(dest="https_command")
@@ -413,6 +526,8 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Show certificate and webroot domain status")
     status.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     status.add_argument("--probe-webroot", action="store_true", help="Probe each domain's webroot")
+    status.add_argument("--domain", action="append", help="Filter by domain; can be repeated or comma-separated")
+    status.add_argument("--domains", help="Comma-separated domains to filter")
     status.add_argument(
         "--only",
         choices=["bound", "unbound", "webroot-ok", "webroot-failed"],
@@ -421,6 +536,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     tui = subparsers.add_parser("tui", help="View summary plus webroot success and failure")
     tui.add_argument("--config", default="baota.ini", help="Path to baota.ini")
+    tui.add_argument("--domain", action="append", help="Filter by domain; can be repeated or comma-separated")
+    tui.add_argument("--domains", help="Comma-separated domains to filter")
     tui.add_argument(
         "--only",
         choices=["bound", "unbound", "webroot-ok", "webroot-failed"],
@@ -431,7 +548,17 @@ def build_parser() -> argparse.ArgumentParser:
     renew = subparsers.add_parser("renew", help="Probe webroot and renew all renewable sites")
     renew.add_argument("--config", default="baota.ini", help="Path to baota.ini")
     renew.add_argument("--dry-run", action="store_true", help="Probe only; do not submit renewal")
+    renew.add_argument("--domain", action="append", help="Include matching domain; can be repeated or comma-separated")
     renew.add_argument("--domains", help="Comma-separated domains to include (default: all accessible)")
+    renew.add_argument(
+        "--ca",
+        help=f"ACME CA for new certificates. Built-ins: {', '.join(sorted(ACME_DIRECTORY_URLS))}",
+    )
+    renew.add_argument(
+        "--ca-fallback",
+        action="append",
+        help="Fallback CA when the current CA is rate-limited; can be repeated or comma-separated",
+    )
     return parser
 
 

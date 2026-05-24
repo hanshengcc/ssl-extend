@@ -27,6 +27,8 @@ url = https://1.2.3.4:8888
 api_key = xxxxxxxxx
 verify_ssl = false
 timeout = 15
+default_ca = letsencrypt
+ca_fallbacks = buypass
 ```
 
 要求：
@@ -34,6 +36,33 @@ timeout = 15
 - 宝塔面板已开启 API。
 - 宝塔 API 白名单已放行运行本工具的 IP。
 - `url` 必须和面板实际协议一致，HTTP 面板不要写成 HTTPS。
+- `default_ca` 用于没有证书的新站点，命令行 `--ca` 可临时覆盖。
+- `ca_fallbacks` 仅在当前 CA 返回限速或配额错误时自动切换，不会对 webroot 验证失败、参数错误、接口错误兜底。
+- 不配置 `ca_fallbacks` 且不传 `--ca-fallback` 时，工具会使用内置备用顺序：`buypass, letsencrypt, litessl, zerossl, google, sslcom`，并自动跳过当前主 CA。
+
+内置 ACME CA：
+
+- `letsencrypt`
+- `letsencrypt-staging`
+- `litessl`
+- `buypass`
+- `buypass-staging`
+- `zerossl`
+- `google`
+- `sslcom`
+
+`zerossl`、`google`、`sslcom` 通常需要 External Account Binding，在对应 `[panel.*]` 中配置：
+
+```ini
+acme_eab_kid = your-kid
+acme_eab_hmac_key = your-hmac-key
+```
+
+需要接入其他 ACME 服务商时，可配置：
+
+```ini
+acme_directory_url = https://acme.example.com/directory
+```
 
 ## 常用命令
 
@@ -63,6 +92,28 @@ btr cert apply --dry-run
 btr cert apply
 ```
 
+指定免费 CA 申请新证书：
+
+```powershell
+btr cert apply --ca buypass
+```
+
+当前 CA 限速时自动切换到备用 CA：
+
+```powershell
+btr cert apply --ca letsencrypt
+btr cert apply --ca letsencrypt --ca-fallback buypass
+btr cert apply --ca letsencrypt --ca-fallback buypass,zerossl
+```
+
+按域名在所有宝塔面板中搜索并处理匹配站点，支持重复传入和逗号分隔：
+
+```powershell
+btr cert apply --domain example.com
+btr cert apply --domain example.com --domain example.net
+btr cert apply --domains example.com,example.net
+```
+
 查看 webroot 验证失败的域名：
 
 ```powershell
@@ -90,17 +141,7 @@ btr https disable --yes
 8. 如果宝塔返回“当前没有可以续订的证书”，则改为新申请证书。
 9. 新申请成功后调用 `/site?action=SetSSL` 保存证书到站点。
 
-新申请证书使用宝塔 ACME 接口：
-
-```text
-POST /acme?action=apply_cert_api
-```
-
-核心参数：
-
-```text
-domains, auth_type, auto_to, auto_wildcard, id, ca
-```
+新申请证书使用内置 ACME HTTP-01 客户端。证书签发成功后，工具会调用 `/site?action=SetSSL` 将证书保存到宝塔站点。
 
 ## Webroot 预检
 
